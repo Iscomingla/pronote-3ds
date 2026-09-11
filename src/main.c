@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "network.h"
 
 // Constants
 #define MAX_URL_LEN 256
@@ -124,7 +125,7 @@ void open_keyboard(int field) {
     }
 }
 
-// Validate login (offline validation)
+// Validate login - actually connects to Pronote
 int validate_login(const char *school, const char *username, const char *password) {
     if (strlen(school) == 0 || strlen(username) == 0 || strlen(password) == 0) {
         safe_strncpy(app_state.status_message, "Fill all fields!", sizeof(app_state.status_message));
@@ -138,10 +139,20 @@ int validate_login(const char *school, const char *username, const char *passwor
         return 0;
     }
 
-    // Simulated validation (no actual network)
-    safe_strncpy(app_state.status_message, "Ready to connect (offline mode)", sizeof(app_state.status_message));
+    // Attempt actual login
+    safe_strncpy(app_state.status_message, "Connecting...", sizeof(app_state.status_message));
     app_state.needs_redraw = 1;
-    return 1;
+    
+    if (pronote_login(school, username, password)) {
+        safe_strncpy(app_state.status_message, "Login successful!", sizeof(app_state.status_message));
+        app_state.logged_in = 1;
+    } else {
+        safe_strncpy(app_state.status_message, "Login failed or offline", sizeof(app_state.status_message));
+        app_state.logged_in = 0;
+    }
+    
+    app_state.needs_redraw = 1;
+    return app_state.logged_in;
 }
 
 int main(int argc, char *argv[]) {
