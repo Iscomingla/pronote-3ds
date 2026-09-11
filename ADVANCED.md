@@ -1,439 +1,134 @@
-# Advanced Features & Implementations
+# Advanced — Architecture & Internals
 
-## Alternative Implementations
+This document explains how the app is structured and how each component works, for contributors or anyone who wants to extend it.
 
-### 1. Session Persistence (Cookie Handling)
+---
 
-```c
-// After successful login, save session cookie:
-typedef struct {
-    char session_id[256];
-    time_t login_time;
-    int is_valid;
-} SessionInfo;
+## Project Structure
 
-SessionInfo session = {0};
-
-// Modify perform_login() to extract cookies:
-curl_easy_setopt(curl, CURLOPT_COOKIEFILE, "");  // In-memory
-curl_easy_setopt(curl, CURLOPT_COOKIEJAR, "pronote.cookie");  // Save to file
-
-// Use saved session for next request:
-curl_easy_setopt(curl, CURLOPT_COOKIEFILE, "pronote.cookie");
 ```
-
-### 2. Response Parsing for Grades
-
-```c
-#include <regex.h>
-
-int extract_grades(const char *html) {
-    regex_t regex;
-    regmatch_t match[2];
-    
-    // Example: Extract grade values from HTML
-    const char *pattern = "<td class=\"note\">([0-9.]+)</td>";
-    
-    if (regcomp(&regex, pattern, REG_EXTENDED) == 0) {
-        if (regexec(&regex, html, 2, match, 0) == 0) {
-            // Parse matched grade
-            printf("Grade: %.*s\n", 
-                (int)(match[1].rm_eo - match[1].rm_so),
-                html + match[1].rm_so);
-        }
-        regfree(&regex);
-    }
-    return 0;
-}
-```
-
-### 3. Screen Output with Scrolling
-
-```c
-#define MAX_LINES 50
-#define LINE_HEIGHT 16
-
-typedef struct {
-    char lines[MAX_LINES][SCREEN_WIDTH];
-    int num_lines;
-    int scroll_offset;
-} ScrollBuffer;
-
-ScrollBuffer output;
-
-void scroll_draw() {
-    consoleClear();
-    
-    int start = output.scroll_offset;
-    int end = start + (SCREEN_HEIGHT / LINE_HEIGHT);
-    
-    for (int i = start; i < end && i < output.num_lines; i++) {
-        printf("%s\n", output.lines[i - start]);
-    }
-}
-
-void handle_scroll_input(u32 kdown) {
-    if (kdown & KEY_UP) output.scroll_offset--;
-    if (kdown & KEY_DOWN) output.scroll_offset++;
-    
-    // Clamp scroll
-    if (output.scroll_offset < 0) output.scroll_offset = 0;
-    if (output.scroll_offset > output.num_lines - 10) 
-        output.scroll_offset = output.num_lines - 10;
-}
-```
-
-### 4. Dual-Screen Layout
-
-```c
-// Use both top and bottom screens
-int main() {
-    gfxInitDefault();
-    
-    // Initialize both screens
-    consoleInit(GFX_TOP, NULL);    // Top screen for login
-    consoleInit(GFX_BOTTOM, NULL); // Bottom screen for info
-    
-    // Draw to different screens:
-    printf("\n\nTop screen content\n");  // Renders on top
-    
-    // Switch to bottom screen context
-    // Use BOTTOM screen for keyboard hints, status, etc.
-}
-```
-
-### 5. Multi-Language Support
-
-```c
-typedef struct {
-    const char *school;
-    const char *username;
-    const char *password;
-    const char *login;
-    const char *status;
-} Language;
-
-Language lang_en = {
-    .school = "School Code",
-    .username = "Username",
-    .password = "Password",
-    .login = "LOGIN",
-    .status = "Status"
-};
-
-Language lang_fr = {
-    .school = "Code école",
-    .username = "Identifiant",
-    .password = "Mot de passe",
-    .login = "CONNEXION",
-    .status = "État"
-};
-
-Language *current_lang = &lang_en;
-
-void draw_ui_translated() {
-    printf("> %s: [%s]\n", current_lang->school, app_state.school_number);
-}
-```
-
-### 6. Secure Credential Storage
-
-```c
-#include <mbedtls/cipher.h>
-
-typedef struct {
-    unsigned char encrypted[256];
-    size_t enc_len;
-    unsigned char salt[16];
-} EncryptedCreds;
-
-// Simple XOR encryption (NOT production-grade!)
-void simple_encrypt(const char *plain, unsigned char *out, size_t *out_len) {
-    const char *key = "3DS_PRONOTE_KEY";
-    
-    *out_len = strlen(plain);
-    for (size_t i = 0; i < *out_len; i++) {
-        out[i] = plain[i] ^ key[i % strlen(key)];
-    }
-}
-
-void save_credentials_encrypted(const char *school, const char *user, const char *pass) {
-    FILE *f = fopen("pronote.conf", "wb");
-    if (f) {
-        unsigned char enc[256];
-        size_t len;
-        
-        simple_encrypt(school, enc, &len);
-        fwrite(enc, 1, len, f);
-        
-        fclose(f);
-    }
-}
+notApro/
+├── src/
+│   ├── main.c       # App loop, UI, input handling
+│   ├── qr.c         # Camera capture + quirc QR decoding
+│   ├── qr.h
+│   ├── network.c    # HTTP stub (not yet implemented)
+│   └── network.h
+├── lib/
+│   └── quirc/       # Bundled QR decoding library
+├── include/
+├── Makefile
+└── Makefile.simple
 ```
 
 ---
 
-## Extended Features
+## App State
 
-### 7. Display Parsed Grades
+All runtime state lives in a single `AppState` struct in `main.c`:
 
 ```c
 typedef struct {
-    char subject[64];
-    float grade;
-    float max_grade;
-} GradeEntry;
-
-GradeEntry grades[20];
-int grade_count = 0;
-
-void parse_and_display_grades(const char *html) {
-    // Simple HTML parser (could use libxml2)
-    const char *ptr = html;
-    
-    while ((ptr = strstr(ptr, "subject")) != NULL) {
-        // Extract subject name
-        // Extract grade value
-        // Store in grades array
-        grade_count++;
-        ptr++;
-    }
-    
-    // Display formatted grades
-    for (int i = 0; i < grade_count; i++) {
-        printf("%s: %.1f/%.1f\n", 
-            grades[i].subject, 
-            grades[i].grade, 
-            grades[i].max_grade);
-    }
-}
+    char username[64];       // From QR JSON: "login"
+    char jeton[256];         // From QR JSON: "jeton" (encrypted token)
+    char pin[5];             // 4-digit PIN + null terminator
+    char uuid[37];           // Device identifier (static for now)
+    int  current_field;      // 0=username, 1=jeton/QR, 2=pin
+    int  logged_in;          // 1 after successful login
+    char status_message[128];
+    int  needs_redraw;
+    Screen screen;           // SCREEN_LOGIN or SCREEN_QR_SCAN
+} AppState;
 ```
 
-### 8. Real-Time Status Updates
-
-```c
-#define STATUS_CONNECTING   0
-#define STATUS_LOGGING_IN   1
-#define STATUS_PARSING      2
-#define STATUS_COMPLETE     3
-#define STATUS_ERROR        4
-
-typedef struct {
-    int status;
-    float progress;  // 0.0 to 1.0
-    char message[128];
-} LoadingState;
-
-LoadingState loading;
-
-void draw_loading_screen() {
-    printf("    Loading... %d%%\n", (int)(loading.progress * 100));
-    
-    // Draw progress bar
-    int bar_width = 20;
-    int filled = (int)(bar_width * loading.progress);
-    printf("    [");
-    for (int i = 0; i < bar_width; i++) {
-        printf(i < filled ? "=" : " ");
-    }
-    printf("]\n");
-    
-    printf("    %s\n", loading.message);
-}
-```
-
-### 9. Error Recovery & Retry Logic
-
-```c
-#define MAX_RETRIES 3
-#define RETRY_DELAY_MS 2000
-
-int perform_login_with_retry(const char *school, const char *user, const char *pass) {
-    for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
-        snprintf(app_state.status_message, sizeof(app_state.status_message),
-                "Attempt %d/%d...", attempt + 1, MAX_RETRIES);
-        
-        if (perform_login(school, user, pass)) {
-            return 1;  // Success
-        }
-        
-        if (attempt < MAX_RETRIES - 1) {
-            // Wait before retry
-            svcSleepThread(RETRY_DELAY_MS * 1000000);  // Convert to nanoseconds
-        }
-    }
-    
-    strncpy(app_state.status_message, "All attempts failed", 
-            sizeof(app_state.status_message) - 1);
-    return 0;
-}
-```
-
-### 10. File-Based Logging
-
-```c
-FILE *log_file = NULL;
-
-void log_message(const char *format, ...) {
-    if (!log_file) {
-        log_file = fopen("pronote_log.txt", "a");
-    }
-    
-    if (log_file) {
-        va_list args;
-        va_start(args, format);
-        vfprintf(log_file, format, args);
-        fprintf(log_file, "\n");
-        va_end(args);
-        fflush(log_file);
-    }
-    
-    // Also log to console
-    printf("LOG: ");
-    va_list args2;
-    va_start(args2, format);
-    vprintf(format, args2);
-    va_end(args2);
-    printf("\n");
-}
-
-// Use it:
-log_message("Login attempt for user: %s", username);
-log_message("Connection status: %s", curl_easy_strerror(res));
-```
+The `needs_redraw` flag gates all `draw_login_ui()` calls so the console is only redrawn when something changes.
 
 ---
 
-## Advanced CURL Options
+## QR Scanning (`src/qr.c`)
 
-```c
-// Add these to perform_login() for better handling:
+The scanner uses the 3DS outward camera (CAM1) and the bundled `quirc` library.
 
-// Follow redirects
-curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
+**Flow:**
+1. `qr_scan()` initialises quirc with a 400×240 buffer
+2. Activates `SELECT_OUT1` (top-screen camera) via `camInit()` / `CAMU_*`
+3. Each frame: captures YUV422 → extracts the Y (luma) channel into quirc's image buffer
+4. Calls `quirc_end()` → `quirc_count()` → `quirc_extract()` → `quirc_decode()`
+5. On success: copies the raw payload string into `out_buf` and returns `QR_SUCCESS`
+6. `KEY_B` exits the loop with `QR_CANCELLED`
 
-// Custom headers
-struct curl_slist *headers = NULL;
-headers = curl_slist_append(headers, "Content-Type: application/x-www-form-urlencoded");
-headers = curl_slist_append(headers, "Accept: text/html,application/xhtml+xml");
-curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+**Return values** (defined in `qr.h`):
 
-// Connection pooling
-curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
-curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 300L);
+| Value | Meaning |
+|---|---|
+| `QR_SUCCESS` | Valid QR decoded, payload in `out_buf` |
+| `QR_CANCELLED` | User pressed B |
+| `QR_ERROR` | Camera or quirc init failed |
 
-// Debugging
-curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
-
-// Clean up headers
-curl_slist_free_all(headers);
-```
+**JSON parsing** happens back in `main.c` after `qr_scan()` returns — a simple `strstr` walk extracts `"login"` and `"jeton"` from the payload.
 
 ---
 
-## Memory Management Best Practices
+## Input & Screen Flow
 
-```c
-// For large data handling:
-#define CHUNK_SIZE 1024
-
-typedef struct {
-    char *data;
-    size_t size;
-    size_t capacity;
-} DynamicBuffer;
-
-DynamicBuffer* create_buffer() {
-    DynamicBuffer *buf = malloc(sizeof(DynamicBuffer));
-    buf->data = malloc(CHUNK_SIZE);
-    buf->size = 0;
-    buf->capacity = CHUNK_SIZE;
-    return buf;
-}
-
-void append_to_buffer(DynamicBuffer *buf, const char *data, size_t len) {
-    if (buf->size + len > buf->capacity) {
-        buf->capacity *= 2;
-        buf->data = realloc(buf->data, buf->capacity);
-    }
-    memcpy(buf->data + buf->size, data, len);
-    buf->size += len;
-}
-
-void free_buffer(DynamicBuffer *buf) {
-    free(buf->data);
-    free(buf);
-}
 ```
+[SCREEN_LOGIN]
+    KEY_UP/DOWN  → move current_field (0-2)
+    KEY_A        → field 0/2: open software keyboard (swkbd)
+                   field 1:   switch to SCREEN_QR_SCAN
+    KEY_Y        → clear current field
+    KEY_X        → validate & attempt login
+    KEY_START    → exit
+
+[SCREEN_QR_SCAN]
+    (handled entirely inside qr_scan())
+    KEY_B        → return QR_CANCELLED → back to SCREEN_LOGIN
+```
+
+The software keyboard (`swkbd`) is opened with `SWKBD_TYPE_NORMAL` for username and `SWKBD_TYPE_NUMPAD` + `SWKBD_PASSWORD_HIDE_DELAY` for the PIN.
 
 ---
 
-## Performance Optimization
+## Network (`src/network.c`)
 
-### Reduce HTTPS Overhead
+Currently a stub:
+
 ```c
-// Reuse connection
-curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
-curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, 0L);
-```
-
-### Implement Response Caching
-```c
-typedef struct {
-    time_t last_fetch;
-    char *data;
-    int valid;
-} CachedResponse;
-
-CachedResponse cache = {0};
-#define CACHE_DURATION 300  // 5 minutes
-
-int use_cached_if_valid() {
-    time_t now = time(NULL);
-    if (cache.valid && (now - cache.last_fetch) < CACHE_DURATION) {
-        return 1;  // Use cached data
-    }
-    return 0;
+int pronote_login(const char *school_number, const char *username, const char *password) {
+    printf("Login stub: %s@%s\n", username, school_number);
+    return 0;  // Not implemented
 }
 ```
 
----
-
-## Testing & Debugging
-
-### Enable Debug Output
-```c
-#ifdef DEBUG_MODE
-#define DEBUG(fmt, ...) printf("[DEBUG] " fmt "\n", ##__VA_ARGS__)
-#else
-#define DEBUG(fmt, ...)
-#endif
-
-// Use it:
-DEBUG("School code: %s", school_number);
-DEBUG("Response size: %zu bytes", resp.size);
-```
-
-### Network Packet Inspection
-```c
-// Enable CURL verbose mode to see all requests/responses
-curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
-
-// Redirect debug output to file
-FILE *debug_log = fopen("curl_debug.log", "w");
-curl_easy_setopt(curl, CURLOPT_STDERR, debug_log);
-```
+The next step is to replace this with libctru's HTTP service (`httpcInit`, `httpcOpenContext`, etc.) to POST the decrypted credentials to the Pronote endpoint. See [TODO.md](TODO.md) for the planned implementation order.
 
 ---
 
-## Next Steps
+## Build System
 
-1. **Implement credential caching** - Make repeated logins faster
-2. **Add response parsing** - Actually display Pronote data
-3. **Implement refresh mechanism** - Auto-update grades
-4. **Add error handling** - Better recovery from failures
-5. **Create UI improvements** - Multi-screen layout
-6. **Add settings menu** - Configurable options
+The `Makefile` is the standard devkitPro 3DS template. Key variables:
 
-Each feature builds on the foundation. Start with the basic app working, then add features incrementally!
+| Variable | Value |
+|---|---|
+| `TARGET` | `notApro` (becomes `notApro.3dsx`) |
+| `SOURCES` | `src lib/quirc` |
+| `INCLUDES` | `include lib` |
+| `LIBS` | `-lctru -lm` |
+
+All `.c` files under `src/` and `lib/quirc/` are compiled automatically. No curl, no external network library — only libctru.
+
+`Makefile.simple` is a minimal fallback for environments where the full devkitPro template isn't available.
+
+---
+
+## Pronote QR Protocol (what we know)
+
+The QR code generated by Pronote's mobile/web app encodes a JSON string:
+
+```json
+{"login": "<username>", "jeton": "<encrypted_token>", "url": "<school_url>"}
+```
+
+- `login` is the plaintext username
+- `jeton` is the session token **encrypted with the 4-digit PIN**
+- The decryption algorithm and the subsequent HTTP authentication flow are not yet reverse-engineered — this is the main remaining unknown. See [TODO.md](TODO.md).

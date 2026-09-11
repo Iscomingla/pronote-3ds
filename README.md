@@ -1,12 +1,14 @@
-# notApro - Pronote on 3DS
+# notApro — Pronote on 3DS
 
 A Nintendo 3DS homebrew app to access Pronote (French school management system) using QR code authentication.
+
+> **Status:** QR scanning and PIN entry work. Actual login (PIN decryption + HTTP request) is not yet implemented — see [TODO.md](TODO.md).
 
 ## Requirements
 
 - **devkitPro** with devkitARM: https://devkitpro.org/wiki/Getting_Started
 - **libctru** (included with devkitPro)
-- **quirc** (bundled in `libs/quirc/`)
+- **quirc** (bundled in `lib/quirc/`)
 
 ```bash
 # Required devkitPro packages
@@ -46,6 +48,7 @@ Launch from Homebrew Launcher.
 |--------|--------|
 | **UP/DOWN** | Navigate between fields |
 | **A** | Edit field / Open camera to scan QR |
+| **B** (in scanner) | Cancel scan |
 | **Y** | Clear field |
 | **X** | Login |
 | **START** | Exit |
@@ -53,15 +56,16 @@ Launch from Homebrew Launcher.
 ### Fields
 
 - **Username** — pre-filled automatically after QR scan
-- **Jeton** — scanned from QR code (up to 224 chars, no manual entry needed)
+- **Jeton** — scanned from QR code (up to 255 chars, no manual entry needed)
 - **PIN Code** — 4-digit code shown alongside the QR code
 
 ## Technical Details
 
 - Uses **libctru** for graphics, input, and camera
-- Uses **quirc** for QR code decoding from camera frames
+- Uses **quirc** (`lib/quirc/`) for QR code decoding from camera frames
+- Camera captures at 400×240 in YUV422; Y channel extracted for quirc
 - Pronote QR codes contain a JSON payload: `{"login":"...","jeton":"...","url":"..."}`
-- PIN decryption of jeton → full Pronote authentication (in progress)
+- PIN decryption and HTTP login are not yet implemented — see [TODO.md](TODO.md)
 
 ## License
 
