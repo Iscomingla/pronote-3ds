@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "qr.h"
-#include "quirc/quirc.h"
+#include <quirc.h>
 
 // QR scanner using 3DS camera and quirc library
 // Based on FBI-NH's QR scanning implementation
