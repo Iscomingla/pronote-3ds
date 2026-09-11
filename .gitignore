@@ -1,0 +1,31 @@
+# Build artifacts
+build/
+*.o
+*.3dsx
+*.elf
+*.smdh
+dist/
+
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Temporary
+*.tmp
+*.bak
+*~
