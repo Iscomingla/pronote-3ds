@@ -181,7 +181,7 @@ void open_keyboard(int field) {
         swkbdSetHintText(&swkbd, "Enter username");
         strcpy(temp_buffer, app_state.username);
     } else {
-        swkbdSetFeatures(&swkbd, SWKBD_ALLOW_SPACES | SWKBD_PASSWORD);
+        swkbdSetFeatures(&swkbd, SWKBD_PASSWORD_HIDE);
         swkbdSetHintText(&swkbd, "Enter password");
         strcpy(temp_buffer, app_state.password);
     }
