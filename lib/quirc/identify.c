@@ -560,7 +560,8 @@ static void pixels_setup(struct quirc *q, uint8_t threshold)
 uint8_t *quirc_begin(struct quirc *q, int *w, int *h)
 {
 	q->num_regions=QUIRC_PIXEL_REGION; q->num_capstones=0; q->num_grids=0;
-	if (w) *w=q->w; if (h) *h=q->h;
+	if (w) *w=q->w;
+	if (h) *h=q->h;
 	return q->image;
 }
 
