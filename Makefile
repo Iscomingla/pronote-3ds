@@ -233,7 +233,6 @@ endif
 #---------------------------------------------------------------------------------------
 
 #---------------------------------------------------------------------------------
-# CIA Target (requires bannertool and makerom)
 #---------------------------------------------------------------------------------
 CIA_NAME := $(TARGET).cia
 BANNERTOOL := $(HOME)/Apps/3ds/bannertool.exe
@@ -247,5 +246,44 @@ cia: $(OUTPUT).3dsx
 	@echo "You can install .3dsx using Homebrew Channel or FBI"
 	@echo ""
 	@echo "To build CIA: Use build_cia.sh script"
+
+.PHONY: cia
+
+#---------------------------------------------------------------------------------
+# CIA Build Target (requires makerom)
+#---------------------------------------------------------------------------------
+
+CIA_TARGET := $(TARGET).cia
+MAKEROM := $(HOME)/Apps/3ds/makerom
+
+$(BUILD)/$(TARGET).rsf:
+	@mkdir -p $(BUILD)
+	@echo "Generating RSF configuration..."
+	@echo 'RomFs: null' > $@
+	@echo 'TitleType: Application' >> $@
+	@echo 'ExeFs: null' >> $@
+	@echo 'Option:' >> $@
+	@echo '  UseOnSD: false' >> $@
+	@echo '  FreeProductCode: true' >> $@
+	@echo '  MediaFootPadding: false' >> $@
+	@echo '  EnableCrypt: true' >> $@
+	@echo 'AccessControl:' >> $@
+	@echo '  UseExtSaveData: false' >> $@
+	@echo '  CompressExeFs: true' >> $@
+	@echo '  IsExecutable: true' >> $@
+	@echo '  EnableL2Cache: true' >> $@
+	@echo '  EnableDsp: true' >> $@
+
+$(CIA_TARGET): $(OUTPUT).elf $(BUILD)/$(TARGET).rsf
+	@echo "Building CIA..."
+	@if [ ! -f "$(MAKEROM)" ]; then \
+		echo "Error: makerom not found at $(MAKEROM)"; \
+		exit 1; \
+	fi
+	@$(MAKEROM) -f cia -rsf $(BUILD)/$(TARGET).rsf -elf $(OUTPUT).elf -o $@ 2>/dev/null && \
+		echo "✓ CIA created: $(CIA_TARGET)" || \
+		(echo "⚠ CIA build failed"; echo "Using .3dsx instead: $(OUTPUT).3dsx")
+
+cia: $(CIA_TARGET)
 
 .PHONY: cia
