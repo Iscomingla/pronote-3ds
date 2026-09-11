@@ -56,7 +56,7 @@ void draw_ui() {
         printf("> QR Code: [SCANNED]\n");
         printf("  School: %s\n\n", app_state.url);
         printf("> PIN Code: [");
-        for (int i = 0; i < strlen(app_state.pin); i++) printf("*");
+        for (int i = 0; i < (int)strlen(app_state.pin); i++) printf("*");
         printf("]\n");
         printf("  (4 digits)\n");
     }
@@ -107,6 +107,60 @@ void open_keyboard_for_qr() {
     }
 }
 
+void handle_pin_digit_input(u32 kdown) {
+    // Handle number pad input: 0-9
+    if (kdown & KEY_0 && strlen(app_state.pin) < 4) {
+        app_state.pin[strlen(app_state.pin)] = '0';
+        app_state.pin[strlen(app_state.pin) + 1] = '\0';
+        app_state.needs_redraw = 1;
+    }
+    if (kdown & KEY_1 && strlen(app_state.pin) < 4) {
+        app_state.pin[strlen(app_state.pin)] = '1';
+        app_state.pin[strlen(app_state.pin) + 1] = '\0';
+        app_state.needs_redraw = 1;
+    }
+    if (kdown & KEY_2 && strlen(app_state.pin) < 4) {
+        app_state.pin[strlen(app_state.pin)] = '2';
+        app_state.pin[strlen(app_state.pin) + 1] = '\0';
+        app_state.needs_redraw = 1;
+    }
+    if (kdown & KEY_3 && strlen(app_state.pin) < 4) {
+        app_state.pin[strlen(app_state.pin)] = '3';
+        app_state.pin[strlen(app_state.pin) + 1] = '\0';
+        app_state.needs_redraw = 1;
+    }
+    if (kdown & KEY_4 && strlen(app_state.pin) < 4) {
+        app_state.pin[strlen(app_state.pin)] = '4';
+        app_state.pin[strlen(app_state.pin) + 1] = '\0';
+        app_state.needs_redraw = 1;
+    }
+    if (kdown & KEY_5 && strlen(app_state.pin) < 4) {
+        app_state.pin[strlen(app_state.pin)] = '5';
+        app_state.pin[strlen(app_state.pin) + 1] = '\0';
+        app_state.needs_redraw = 1;
+    }
+    if (kdown & KEY_6 && strlen(app_state.pin) < 4) {
+        app_state.pin[strlen(app_state.pin)] = '6';
+        app_state.pin[strlen(app_state.pin) + 1] = '\0';
+        app_state.needs_redraw = 1;
+    }
+    if (kdown & KEY_7 && strlen(app_state.pin) < 4) {
+        app_state.pin[strlen(app_state.pin)] = '7';
+        app_state.pin[strlen(app_state.pin) + 1] = '\0';
+        app_state.needs_redraw = 1;
+    }
+    if (kdown & KEY_8 && strlen(app_state.pin) < 4) {
+        app_state.pin[strlen(app_state.pin)] = '8';
+        app_state.pin[strlen(app_state.pin) + 1] = '\0';
+        app_state.needs_redraw = 1;
+    }
+    if (kdown & KEY_9 && strlen(app_state.pin) < 4) {
+        app_state.pin[strlen(app_state.pin)] = '9';
+        app_state.pin[strlen(app_state.pin) + 1] = '\0';
+        app_state.needs_redraw = 1;
+    }
+}
+
 int main(int argc, char *argv[]) {
     gfxInitDefault();
     consoleInit(GFX_TOP, NULL);
@@ -136,15 +190,7 @@ int main(int argc, char *argv[]) {
             }
         } else {
             // PIN entry mode
-            // Handle 0-9 keys for PIN input
-            for (int i = 0; i < 10; i++) {
-                if (kdown & (KEY_0 << i)) {
-                    if (strlen(app_state.pin) < 4) {
-                        app_state.pin[strlen(app_state.pin)] = '0' + i;
-                        app_state.needs_redraw = 1;
-                    }
-                }
-            }
+            handle_pin_digit_input(kdown);
 
             if (kdown & KEY_B) {
                 if (strlen(app_state.pin) > 0) {
