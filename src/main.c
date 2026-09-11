@@ -17,6 +17,7 @@ typedef struct {
     int current_field; // 0: school, 1: username, 2: password
     int logged_in;
     char status_message[128];
+    int needs_redraw;  // Track if UI needs redraw
 } AppState;
 
 AppState app_state;
@@ -30,7 +31,7 @@ void safe_strncpy(char *dest, const char *src, size_t maxlen) {
     dest[len] = '\0';
 }
 
-// Draw the UI
+// Draw the UI (only call when needs_redraw is true)
 void draw_ui() {
     consoleClear();
     printf("\x1b[2;0H"); // Move to row 2
@@ -71,6 +72,9 @@ void draw_ui() {
     printf("X:        Submit login\n");
     printf("START:    Exit\n\n");
     printf("Status: %s\n", app_state.status_message);
+    
+    gfxFlushBuffers();
+    gfxSwapBuffers();
 }
 
 // Get pointer to current field
@@ -112,6 +116,7 @@ void open_keyboard(int field) {
         char *target = get_field_pointer(field);
         int maxlen = get_field_maxlen(field);
         safe_strncpy(target, temp_buffer, maxlen + 1);
+        app_state.needs_redraw = 1;  // Mark for redraw after keyboard
     }
 }
 
@@ -119,16 +124,19 @@ void open_keyboard(int field) {
 int validate_login(const char *school, const char *username, const char *password) {
     if (strlen(school) == 0 || strlen(username) == 0 || strlen(password) == 0) {
         safe_strncpy(app_state.status_message, "Fill all fields!", sizeof(app_state.status_message));
+        app_state.needs_redraw = 1;
         return 0;
     }
 
     if (strlen(school) < 5) {
         safe_strncpy(app_state.status_message, "School code too short", sizeof(app_state.status_message));
+        app_state.needs_redraw = 1;
         return 0;
     }
 
     // Simulated validation (no actual network)
     safe_strncpy(app_state.status_message, "Ready to connect (offline mode)", sizeof(app_state.status_message));
+    app_state.needs_redraw = 1;
     return 1;
 }
 
@@ -139,23 +147,25 @@ int main(int argc, char *argv[]) {
     // Initialize app state
     memset(&app_state, 0, sizeof(AppState));
     safe_strncpy(app_state.status_message, "Ready to login", sizeof(app_state.status_message));
+    app_state.needs_redraw = 1;  // Initial draw
 
     while (aptMainLoop()) {
-        gspWaitForVBlank();
         hidScanInput();
-
         u32 kdown = hidKeysDown();
 
+        // Handle input and mark for redraw if needed
         if (kdown & KEY_START) {
             break;
         }
 
         if (kdown & KEY_UP) {
             app_state.current_field = (app_state.current_field - 1 + 3) % 3;
+            app_state.needs_redraw = 1;
         }
 
         if (kdown & KEY_DOWN) {
             app_state.current_field = (app_state.current_field + 1) % 3;
+            app_state.needs_redraw = 1;
         }
 
         if (kdown & KEY_A) {
@@ -166,20 +176,26 @@ int main(int argc, char *argv[]) {
             char *field = get_field_pointer(app_state.current_field);
             if (strlen(field) > 0) {
                 field[strlen(field) - 1] = '\0';
+                app_state.needs_redraw = 1;
             }
         }
 
         if (kdown & KEY_Y) {
             memset(get_field_pointer(app_state.current_field), 0, get_field_maxlen(app_state.current_field));
+            app_state.needs_redraw = 1;
         }
 
         if (kdown & KEY_X) {
             validate_login(app_state.school_number, app_state.username, app_state.password);
         }
 
-        draw_ui();
-        gfxFlushBuffers();
-        gfxSwapBuffers();
+        // Only redraw if needed
+        if (app_state.needs_redraw) {
+            draw_ui();
+            app_state.needs_redraw = 0;
+        }
+
+        gspWaitForVBlank();  // Wait for vertical blank but don't clear every frame
     }
 
     gfxExit();
