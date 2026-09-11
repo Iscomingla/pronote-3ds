@@ -13,11 +13,11 @@
 typedef struct {
     char username[MAX_USERNAME_LEN];
     char password[MAX_PASSWORD_LEN];
-    char jeton_moyen[MAX_JETON_LEN];    // For decrypting username
-    char jeton_super[MAX_JETON_LEN];    // For decrypting password
+    char jeton_moyen[MAX_JETON_LEN];
+    char jeton_super[MAX_JETON_LEN];
     char url[MAX_URL_LEN];
     char pin[MAX_PIN];
-    char uuid[37];  // UUID format: 8-4-4-4-12 = 36 chars + null
+    char uuid[37];
     int current_field;  // 0: waiting for QR, 1: PIN entry
     int logged_in;
     char status_message[128];
@@ -66,7 +66,7 @@ void draw_ui() {
         printf("A: Paste QR data\n");
         printf("Y: Manual entry\n");
     } else {
-        printf("0-9: Enter PIN digit\n");
+        printf("A: Open numpad\n");
         printf("B: Delete digit\n");
         printf("X: Login\n");
     }
@@ -87,18 +87,13 @@ void open_keyboard_for_qr() {
     SwkbdButton button = swkbdInputText(&swkbd, temp_buffer, sizeof(temp_buffer));
     
     if (button == SWKBD_BUTTON_CONFIRM && strlen(temp_buffer) > 0) {
-        // Parse JSON - simplified parsing for URL, login, jeton
-        // Expecting format like: {"url":"https://...","login":"...","jeton":"..."}
-        
         char *url_start = strstr(temp_buffer, "\"url\"");
         char *login_start = strstr(temp_buffer, "\"login\"");
         char *jeton_start = strstr(temp_buffer, "\"jeton\"");
         
         if (url_start && login_start && jeton_start) {
-            // Extract values (simplified)
-            // Real implementation would need proper JSON parsing
             safe_strncpy(app_state.status_message, "QR data loaded! Enter PIN", sizeof(app_state.status_message));
-            app_state.current_field = 1;  // Move to PIN entry
+            app_state.current_field = 1;
             app_state.needs_redraw = 1;
         } else {
             safe_strncpy(app_state.status_message, "Invalid QR format", sizeof(app_state.status_message));
@@ -107,56 +102,20 @@ void open_keyboard_for_qr() {
     }
 }
 
-void handle_pin_digit_input(u32 kdown) {
-    // Handle number pad input: 0-9
-    if (kdown & KEY_0 && strlen(app_state.pin) < 4) {
-        app_state.pin[strlen(app_state.pin)] = '0';
-        app_state.pin[strlen(app_state.pin) + 1] = '\0';
-        app_state.needs_redraw = 1;
-    }
-    if (kdown & KEY_1 && strlen(app_state.pin) < 4) {
-        app_state.pin[strlen(app_state.pin)] = '1';
-        app_state.pin[strlen(app_state.pin) + 1] = '\0';
-        app_state.needs_redraw = 1;
-    }
-    if (kdown & KEY_2 && strlen(app_state.pin) < 4) {
-        app_state.pin[strlen(app_state.pin)] = '2';
-        app_state.pin[strlen(app_state.pin) + 1] = '\0';
-        app_state.needs_redraw = 1;
-    }
-    if (kdown & KEY_3 && strlen(app_state.pin) < 4) {
-        app_state.pin[strlen(app_state.pin)] = '3';
-        app_state.pin[strlen(app_state.pin) + 1] = '\0';
-        app_state.needs_redraw = 1;
-    }
-    if (kdown & KEY_4 && strlen(app_state.pin) < 4) {
-        app_state.pin[strlen(app_state.pin)] = '4';
-        app_state.pin[strlen(app_state.pin) + 1] = '\0';
-        app_state.needs_redraw = 1;
-    }
-    if (kdown & KEY_5 && strlen(app_state.pin) < 4) {
-        app_state.pin[strlen(app_state.pin)] = '5';
-        app_state.pin[strlen(app_state.pin) + 1] = '\0';
-        app_state.needs_redraw = 1;
-    }
-    if (kdown & KEY_6 && strlen(app_state.pin) < 4) {
-        app_state.pin[strlen(app_state.pin)] = '6';
-        app_state.pin[strlen(app_state.pin) + 1] = '\0';
-        app_state.needs_redraw = 1;
-    }
-    if (kdown & KEY_7 && strlen(app_state.pin) < 4) {
-        app_state.pin[strlen(app_state.pin)] = '7';
-        app_state.pin[strlen(app_state.pin) + 1] = '\0';
-        app_state.needs_redraw = 1;
-    }
-    if (kdown & KEY_8 && strlen(app_state.pin) < 4) {
-        app_state.pin[strlen(app_state.pin)] = '8';
-        app_state.pin[strlen(app_state.pin) + 1] = '\0';
-        app_state.needs_redraw = 1;
-    }
-    if (kdown & KEY_9 && strlen(app_state.pin) < 4) {
-        app_state.pin[strlen(app_state.pin)] = '9';
-        app_state.pin[strlen(app_state.pin) + 1] = '\0';
+void open_numpad_for_pin() {
+    SwkbdState swkbd;
+    char temp_buffer[10] = {0};
+    safe_strncpy(temp_buffer, app_state.pin, sizeof(temp_buffer));
+    
+    // NUMPAD keyboard with 4-digit max and password hide delay
+    swkbdInit(&swkbd, SWKBD_TYPE_NUMPAD, 1, 4);
+    swkbdSetPasswordMode(&swkbd, SWKBD_PASSWORD_HIDE_DELAY);
+    swkbdSetHintText(&swkbd, "Enter 4-digit PIN");
+    
+    SwkbdButton button = swkbdInputText(&swkbd, temp_buffer, sizeof(temp_buffer));
+    
+    if (button == SWKBD_BUTTON_CONFIRM) {
+        safe_strncpy(app_state.pin, temp_buffer, sizeof(app_state.pin));
         app_state.needs_redraw = 1;
     }
 }
@@ -169,8 +128,6 @@ int main(int argc, char *argv[]) {
     safe_strncpy(app_state.status_message, "Ready to scan QR code", sizeof(app_state.status_message));
     app_state.needs_redraw = 1;
 
-    // Generate UUID for this device
-    // In real implementation, would use random generator
     safe_strncpy(app_state.uuid, "3DS-Pronote-Device", sizeof(app_state.uuid));
 
     while (aptMainLoop()) {
@@ -190,7 +147,9 @@ int main(int argc, char *argv[]) {
             }
         } else {
             // PIN entry mode
-            handle_pin_digit_input(kdown);
+            if (kdown & KEY_A) {
+                open_numpad_for_pin();
+            }
 
             if (kdown & KEY_B) {
                 if (strlen(app_state.pin) > 0) {
@@ -204,8 +163,7 @@ int main(int argc, char *argv[]) {
                     safe_strncpy(app_state.status_message, "Decrypting credentials...", sizeof(app_state.status_message));
                     app_state.needs_redraw = 1;
                     
-                    // TODO: Decrypt credentials using PIN
-                    // Would need AES/MD5 implementation
+                    // TODO: Decrypt credentials using PIN with AES/MD5
                     
                     safe_strncpy(app_state.status_message, "PIN accepted! (full auth coming)", sizeof(app_state.status_message));
                     app_state.logged_in = 1;
