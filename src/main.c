@@ -85,6 +85,8 @@ void open_keyboard_for_field() {
     } else {
         swkbdInit(&swkbd, SWKBD_TYPE_NUMPAD, 1, 4);
         swkbdSetPasswordMode(&swkbd, SWKBD_PASSWORD_HIDE_DELAY);
+        swkbdSetValidation(&swkbd, SWKBD_ANYTHING, 0, 0);
+        swkbdSetFeatures(&swkbd, SWKBD_FIXED_WIDTH);
         hint = "Enter 4-digit PIN";
         safe_strncpy(temp_buffer, app_state.pin, sizeof(temp_buffer));
     }
