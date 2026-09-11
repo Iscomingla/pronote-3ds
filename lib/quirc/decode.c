@@ -618,7 +618,7 @@ static int take_bits(struct datastream *ds, int len)
 	return ret;
 }
 
-static int numeric_tuple(const struct quirc_data *data,
+static int numeric_tuple(struct quirc_data *data,
 			 struct datastream *ds,
 			 int bits, int digits)
 {
