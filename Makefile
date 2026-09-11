@@ -231,3 +231,21 @@ $(OUTPUT).elf	:	$(OFILES)
 #---------------------------------------------------------------------------------------
 endif
 #---------------------------------------------------------------------------------------
+
+#---------------------------------------------------------------------------------
+# CIA Target (requires bannertool and makerom)
+#---------------------------------------------------------------------------------
+CIA_NAME := $(TARGET).cia
+BANNERTOOL := $(HOME)/Apps/3ds/bannertool.exe
+MAKEROM := $(HOME)/Apps/3ds/makerom
+
+cia: $(OUTPUT).3dsx
+	@echo "Building CIA..."
+	@mkdir -p build
+	@echo "Note: Full CIA building requires proper metadata setup"
+	@echo ".3dsx available at: $(OUTPUT).3dsx"
+	@echo "You can install .3dsx using Homebrew Channel or FBI"
+	@echo ""
+	@echo "To build CIA: Use build_cia.sh script"
+
+.PHONY: cia
