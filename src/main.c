@@ -53,11 +53,12 @@ void draw_ui() {
     }
     printf("\n");
 
-    // Password field (masked)
+    // Password field (masked) - no keyboard, just display
     if (app_state.current_field == 2) {
         printf("> Password:    [");
         for (int i = 0; i < (int)strlen(app_state.password); i++) printf("*");
         printf("]\n");
+        printf("  (A=Keyboard, B=Delete)\n");
     } else {
         printf("  Password:    [");
         for (int i = 0; i < (int)strlen(app_state.password); i++) printf("*");
@@ -91,8 +92,15 @@ int get_field_maxlen(int field) {
     return MAX_PASSWORD_LEN - 1;
 }
 
-// Open software keyboard
+// Open software keyboard (NOT for password field)
 void open_keyboard(int field) {
+    if (field == 2) {
+        // Skip keyboard for password to avoid parental control prompt
+        safe_strncpy(app_state.status_message, "Use A to add chars, B to delete", sizeof(app_state.status_message));
+        app_state.needs_redraw = 1;
+        return;
+    }
+    
     SwkbdState swkbd;
     char temp_buffer[256] = {0};
     
@@ -101,13 +109,9 @@ void open_keyboard(int field) {
     if (field == 0) {
         swkbdSetHintText(&swkbd, "Enter school code (e.g. 0260008t)");
         safe_strncpy(temp_buffer, app_state.school_number, sizeof(temp_buffer));
-    } else if (field == 1) {
+    } else {
         swkbdSetHintText(&swkbd, "Enter username");
         safe_strncpy(temp_buffer, app_state.username, sizeof(temp_buffer));
-    } else {
-        swkbdSetFeatures(&swkbd, SWKBD_PASSWORD_HIDE);
-        swkbdSetHintText(&swkbd, "Enter password");
-        safe_strncpy(temp_buffer, app_state.password, sizeof(temp_buffer));
     }
 
     SwkbdButton button = swkbdInputText(&swkbd, temp_buffer, sizeof(temp_buffer));
