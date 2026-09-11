@@ -21,6 +21,15 @@ typedef struct {
 
 AppState app_state;
 
+// Safe string copy
+void safe_strncpy(char *dest, const char *src, size_t maxlen) {
+    if (!dest || !src || maxlen == 0) return;
+    size_t len = strlen(src);
+    if (len >= maxlen) len = maxlen - 1;
+    memcpy(dest, src, len);
+    dest[len] = '\0';
+}
+
 // Draw the UI
 void draw_ui() {
     consoleClear();
@@ -87,14 +96,14 @@ void open_keyboard(int field) {
     
     if (field == 0) {
         swkbdSetHintText(&swkbd, "Enter school code (e.g. 0260008t)");
-        strncpy(temp_buffer, app_state.school_number, sizeof(temp_buffer) - 1);
+        safe_strncpy(temp_buffer, app_state.school_number, sizeof(temp_buffer));
     } else if (field == 1) {
         swkbdSetHintText(&swkbd, "Enter username");
-        strncpy(temp_buffer, app_state.username, sizeof(temp_buffer) - 1);
+        safe_strncpy(temp_buffer, app_state.username, sizeof(temp_buffer));
     } else {
         swkbdSetFeatures(&swkbd, SWKBD_PASSWORD_HIDE);
         swkbdSetHintText(&swkbd, "Enter password");
-        strncpy(temp_buffer, app_state.password, sizeof(temp_buffer) - 1);
+        safe_strncpy(temp_buffer, app_state.password, sizeof(temp_buffer));
     }
 
     SwkbdButton button = swkbdInputText(&swkbd, temp_buffer, sizeof(temp_buffer));
@@ -102,25 +111,24 @@ void open_keyboard(int field) {
     if (button == SWKBD_BUTTON_CONFIRM) {
         char *target = get_field_pointer(field);
         int maxlen = get_field_maxlen(field);
-        strncpy(target, temp_buffer, maxlen);
-        target[maxlen] = '\0';
+        safe_strncpy(target, temp_buffer, maxlen + 1);
     }
 }
 
 // Validate login (offline validation)
 int validate_login(const char *school, const char *username, const char *password) {
     if (strlen(school) == 0 || strlen(username) == 0 || strlen(password) == 0) {
-        strncpy(app_state.status_message, "Fill all fields!", sizeof(app_state.status_message) - 1);
+        safe_strncpy(app_state.status_message, "Fill all fields!", sizeof(app_state.status_message));
         return 0;
     }
 
     if (strlen(school) < 5) {
-        strncpy(app_state.status_message, "School code too short", sizeof(app_state.status_message) - 1);
+        safe_strncpy(app_state.status_message, "School code too short", sizeof(app_state.status_message));
         return 0;
     }
 
     // Simulated validation (no actual network)
-    strncpy(app_state.status_message, "Ready to connect (offline mode)", sizeof(app_state.status_message) - 1);
+    safe_strncpy(app_state.status_message, "Ready to connect (offline mode)", sizeof(app_state.status_message));
     return 1;
 }
 
@@ -130,7 +138,7 @@ int main(int argc, char *argv[]) {
 
     // Initialize app state
     memset(&app_state, 0, sizeof(AppState));
-    strncpy(app_state.status_message, "Ready to login", sizeof(app_state.status_message) - 1);
+    safe_strncpy(app_state.status_message, "Ready to login", sizeof(app_state.status_message));
 
     while (aptMainLoop()) {
         gspWaitForVBlank();
