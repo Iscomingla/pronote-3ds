@@ -5,6 +5,7 @@
 #include "ui.h"
 #include "network.h"
 #include "qr.h"
+#include "log.h"
 
 /*
  * The jeton is a hex-encoded AES-CBC ciphertext.
@@ -30,9 +31,6 @@
 #define STATUS_H    18.0f
 #define STATUS_Y    (SCREEN_H - STATUS_H)
 
-/* Controls column layout — key label left-aligned at KEY_X,
-   description left-aligned at DESC_X. DESC_X must clear the widest
-   key label ("START" at size 0.50f ≈ 52 px) plus a small gap. */
 #define CTRL_KEY_X   12.0f
 #define CTRL_DESC_X  64.0f
 
@@ -46,7 +44,7 @@ typedef struct {
     char   jeton[MAX_JETON_LEN];
     char   pin[MAX_PIN];
     char   uuid[37];
-    int    current_field;   /* 0: username  1: jeton (QR)  2: pin */
+    int    current_field;
     int    logged_in;
     char   status_message[128];
     int    needs_redraw;
@@ -63,9 +61,6 @@ static void safe_strncpy(char *dest, const char *src, size_t maxlen) {
     dest[len] = '\0';
 }
 
-/* ---------------------------------------------------------------------------
- * draw_field — one labelled input row
- * --------------------------------------------------------------------------- */
 static void draw_field(float y, const char *label, const char *value,
                        int is_masked, int selected) {
     u32 bg   = selected ? COL_SELECTED : C2D_Color32(0x00, 0x00, 0x00, 0x28);
@@ -80,7 +75,7 @@ static void draw_field(float y, const char *label, const char *value,
         for (int i = 0; i < (int)strlen(value) && i < 4; i++)
             display[i] = '*';
     } else if (strlen(value) == 0) {
-        safe_strncpy(display, "\xe2\x80\x94", sizeof(display)); /* em-dash */
+        safe_strncpy(display, "\xe2\x80\x94", sizeof(display));
     } else if (strlen(value) > 24) {
         memcpy(display, value, 21);
         strcat(display, "...");
@@ -95,16 +90,12 @@ static void draw_field(float y, const char *label, const char *value,
         ui_rect(FIELD_X, y + FIELD_H * 0.25f, 3.0f, FIELD_H * 0.5f, COL_LINE1);
 }
 
-/* ---------------------------------------------------------------------------
- * draw_login_screen
- * --------------------------------------------------------------------------- */
 static void draw_login_screen(void) {
     ui_frame_begin();
 
     ui_clear_target(ui_get_target(GFX_TOP),    COL_BG);
     ui_clear_target(ui_get_target(GFX_BOTTOM), COL_BG);
 
-    /* ---- TOP SCREEN ---- */
     ui_target(GFX_TOP);
 
     ui_rect(0, 0, SCREEN_TOP_W, HEADER_H, C2D_Color32(0x00, 0x60, 0x52, 0xFF));
@@ -136,7 +127,6 @@ static void draw_login_screen(void) {
     ui_hline(0, STATUS_Y, SCREEN_TOP_W, COL_LINE2);
     ui_text(8.0f, STATUS_Y + 2.0f, 0.45f, COL_WHITE, app.status_message);
 
-    /* ---- BOTTOM SCREEN — controls ---- */
     ui_target(GFX_BOTTOM);
 
     ui_rect(0, 0, SCREEN_BOT_W, HEADER_H, C2D_Color32(0x00, 0x60, 0x52, 0xFF));
@@ -160,11 +150,9 @@ static void draw_login_screen(void) {
     ui_frame_end();
 }
 
-/* ---------------------------------------------------------------------------
- * open_keyboard — swkbd for the active field
- * --------------------------------------------------------------------------- */
 static void open_keyboard(void) {
     if (app.current_field == 1) {
+        LOG("QR scan triggered");
         app.screen = SCREEN_QR_SCAN;
         return;
     }
@@ -188,22 +176,25 @@ static void open_keyboard(void) {
 
     memset(tmp, 0, sizeof(tmp));
     if (swkbdInputText(&swkbd, tmp, sizeof(tmp)) == SWKBD_BUTTON_CONFIRM) {
-        if (app.current_field == 0)
+        if (app.current_field == 0) {
             safe_strncpy(app.username, tmp, sizeof(app.username));
-        else
+            LOG("username set: %s", app.username);
+        } else {
             safe_strncpy(app.pin, tmp, sizeof(app.pin));
+            LOG("PIN entered (%zu digits)", strlen(app.pin));
+        }
         app.needs_redraw = 1;
     }
 }
 
-/* ---------------------------------------------------------------------------
- * main
- * --------------------------------------------------------------------------- */
 int main(int argc, char *argv[]) {
     (void)argc; (void)argv;
 
     gfxInitDefault();
+    log_init();
     ui_init();
+
+    LOG("notApro started");
 
     memset(&app, 0, sizeof(AppState));
     safe_strncpy(app.status_message, "Scan QR code, then enter PIN",
@@ -214,12 +205,13 @@ int main(int argc, char *argv[]) {
 
     while (aptMainLoop()) {
 
-        /* ---- QR scan mode ---- */
         if (app.screen == SCREEN_QR_SCAN) {
             char qr_result[MAX_JETON_LEN + MAX_USERNAME_LEN + 64] = {0};
-            int  rc = qr_scan(qr_result, sizeof(qr_result));
+            LOG("starting QR scan");
+            int rc = qr_scan(qr_result, sizeof(qr_result));
 
             if (rc == QR_SUCCESS) {
+                LOG("QR scan success, raw len=%zu", strlen(qr_result));
                 char *lp = strstr(qr_result, "\"login\":");
                 char *jp = strstr(qr_result, "\"jeton\":");
 
@@ -231,6 +223,7 @@ int main(int argc, char *argv[]) {
                         if (n >= MAX_USERNAME_LEN) n = MAX_USERNAME_LEN - 1;
                         memcpy(app.username, lp, n);
                         app.username[n] = '\0';
+                        LOG("parsed username: %s", app.username);
                     }
                     jp += 9;
                     e = strchr(jp, '"');
@@ -239,18 +232,22 @@ int main(int argc, char *argv[]) {
                         if (n >= MAX_JETON_LEN) n = MAX_JETON_LEN - 1;
                         memcpy(app.jeton, jp, n);
                         app.jeton[n] = '\0';
+                        LOG("parsed jeton (%zu chars)", strlen(app.jeton));
                     }
                     safe_strncpy(app.status_message, "QR scanned! Enter PIN.",
                                  sizeof(app.status_message));
                     app.current_field = 2;
                 } else {
+                    LOG("QR parse failed — unexpected format");
                     safe_strncpy(app.status_message, "Invalid QR format.",
                                  sizeof(app.status_message));
                 }
             } else if (rc == QR_CANCELLED) {
+                LOG("QR scan cancelled");
                 safe_strncpy(app.status_message, "Scan cancelled.",
                              sizeof(app.status_message));
             } else {
+                LOG("QR scan error (rc=%d)", rc);
                 safe_strncpy(app.status_message, "QR scan failed.",
                              sizeof(app.status_message));
             }
@@ -260,11 +257,13 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        /* ---- Login screen input ---- */
         hidScanInput();
         u32 kdown = hidKeysDown();
 
-        if (kdown & KEY_START) break;
+        if (kdown & KEY_START) {
+            LOG("exit requested");
+            break;
+        }
 
         if (kdown & KEY_UP) {
             app.current_field = (app.current_field - 1 + 3) % 3;
@@ -282,19 +281,24 @@ int main(int argc, char *argv[]) {
             if      (app.current_field == 0) memset(app.username, 0, sizeof(app.username));
             else if (app.current_field == 1) memset(app.jeton,    0, sizeof(app.jeton));
             else                             memset(app.pin,       0, sizeof(app.pin));
+            LOG("field %d cleared", app.current_field);
             app.needs_redraw = 1;
         }
         if (kdown & KEY_X) {
-            if (strlen(app.username) == 0)
+            if (strlen(app.username) == 0) {
+                LOG("login attempt: no username");
                 safe_strncpy(app.status_message, "Enter username first!",
                              sizeof(app.status_message));
-            else if (strlen(app.jeton) == 0)
+            } else if (strlen(app.jeton) == 0) {
+                LOG("login attempt: no jeton");
                 safe_strncpy(app.status_message, "Scan QR code first!",
                              sizeof(app.status_message));
-            else if (strlen(app.pin) != 4)
+            } else if (strlen(app.pin) != 4) {
+                LOG("login attempt: PIN length %zu (expected 4)", strlen(app.pin));
                 safe_strncpy(app.status_message, "PIN must be 4 digits!",
                              sizeof(app.status_message));
-            else {
+            } else {
+                LOG("login attempt: user=%s, jeton_len=%zu", app.username, strlen(app.jeton));
                 safe_strncpy(app.status_message, "Decrypting... (coming soon)",
                              sizeof(app.status_message));
                 app.logged_in = 1;
@@ -310,7 +314,9 @@ int main(int argc, char *argv[]) {
         gspWaitForVBlank();
     }
 
+    LOG("notApro exiting");
     ui_exit();
+    log_close();
     gfxExit();
     return 0;
 }
