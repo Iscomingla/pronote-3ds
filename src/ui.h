@@ -11,6 +11,16 @@
  * Screen dimensions follow libctru conventions:
  *   Top    : 400 × 240
  *   Bottom : 320 × 240
+ *
+ * IMPORTANT — clear/scene ordering:
+ *   C2D_TargetClear MUST happen before C2D_SceneBegin.
+ *   Use the pattern:
+ *     ui_clear_target(ui_get_target(GFX_TOP), COL_BG);
+ *     ui_target(GFX_TOP);
+ *     ... draw calls ...
+ *     ui_clear_target(ui_get_target(GFX_BOTTOM), COL_BG);
+ *     ui_target(GFX_BOTTOM);
+ *     ... draw calls ...
  */
 
 #include <3ds.h>
@@ -47,14 +57,20 @@ void  ui_frame_begin(void);
 void  ui_frame_end(void);
 
 /* -------------------------------------------------------------------------
- * Target selection  (call before drawing to a screen)
+ * Target selection  (call after ui_clear_target, before draw calls)
  * ---------------------------------------------------------------------- */
-void  ui_target(gfxScreen_t screen);
+void               ui_target(gfxScreen_t screen);
+C3D_RenderTarget  *ui_get_target(gfxScreen_t screen);
+
+/* -------------------------------------------------------------------------
+ * Clear — MUST be called before ui_target() for the same screen
+ * ---------------------------------------------------------------------- */
+void  ui_clear_target(C3D_RenderTarget *t, u32 colour);
+void  ui_clear(u32 colour);   /* clears current target; prefer ui_clear_target */
 
 /* -------------------------------------------------------------------------
  * Primitives
  * ---------------------------------------------------------------------- */
-void  ui_clear(u32 colour);
 void  ui_rect(float x, float y, float w, float h, u32 colour);
 void  ui_hline(float x, float y, float len, u32 colour);
 
