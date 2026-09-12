@@ -6,9 +6,29 @@
 #include "network.h"
 #include "qr.h"
 
+/*
+ * The jeton is a hex-encoded AES-CBC ciphertext.
+ * 512 chars gives comfortable headroom beyond any observed real-world value.
+ */
 #define MAX_USERNAME_LEN  64
-#define MAX_JETON_LEN    513
-#define MAX_PIN            5
+#define MAX_JETON_LEN    513   /* 512 usable chars + null */
+#define MAX_PIN            5   /* 4 digits + null */
+
+/* ---------------------------------------------------------------------------
+ * Layout constants
+ * --------------------------------------------------------------------------- */
+#define HEADER_H    36.0f
+#define STRIPE1_Y   HEADER_H
+#define STRIPE1_H    4.0f
+#define STRIPE2_Y   (STRIPE1_Y + STRIPE1_H)
+#define STRIPE2_H    2.0f
+#define CONTENT_Y   (STRIPE2_Y + STRIPE2_H + 12.0f)
+#define FIELD_H     34.0f
+#define FIELD_GAP    8.0f
+#define FIELD_X     16.0f
+#define FIELD_W     (SCREEN_TOP_W - FIELD_X * 2.0f)
+#define STATUS_H    18.0f
+#define STATUS_Y    (SCREEN_H - STATUS_H)
 
 typedef enum {
     SCREEN_LOGIN,
@@ -20,7 +40,7 @@ typedef struct {
     char   jeton[MAX_JETON_LEN];
     char   pin[MAX_PIN];
     char   uuid[37];
-    int    current_field;
+    int    current_field;   /* 0: username  1: jeton (QR)  2: pin */
     int    logged_in;
     char   status_message[128];
     int    needs_redraw;
@@ -37,34 +57,24 @@ static void safe_strncpy(char *dest, const char *src, size_t maxlen) {
     dest[len] = '\0';
 }
 
-#define HEADER_H   36.0f
-#define STRIPE1_Y  (HEADER_H)
-#define STRIPE1_H   4.0f
-#define STRIPE2_Y  (STRIPE1_Y + STRIPE1_H)
-#define STRIPE2_H   2.0f
-#define CONTENT_Y  (STRIPE2_Y + STRIPE2_H + 12.0f)
-#define FIELD_H    34.0f
-#define FIELD_GAP   8.0f
-#define FIELD_X    16.0f
-#define FIELD_W    (SCREEN_TOP_W - FIELD_X * 2.0f)
-#define STATUS_H   18.0f
-#define STATUS_Y   (SCREEN_H - STATUS_H)
-
-static void draw_field(float y, const char *label,
-                       const char *value, int is_masked, int selected) {
+/* ---------------------------------------------------------------------------
+ * draw_field — one labelled input row
+ * --------------------------------------------------------------------------- */
+static void draw_field(float y, const char *label, const char *value,
+                       int is_masked, int selected) {
     u32 bg   = selected ? COL_SELECTED : C2D_Color32(0x00, 0x00, 0x00, 0x28);
     u32 bord = selected ? COL_LINE1    : COL_LINE2;
 
     ui_rect(FIELD_X, y, FIELD_W, FIELD_H, bg);
     ui_hline(FIELD_X, y + FIELD_H - 1.0f, FIELD_W, bord);
-    ui_text(FIELD_X + 8.0f, y + 4.0f,  0.45f, COL_DIMTEXT, label);
+    ui_text(FIELD_X + 8.0f, y + 4.0f, 0.45f, COL_DIMTEXT, label);
 
     char display[128] = {0};
     if (is_masked && strlen(value) > 0) {
         for (int i = 0; i < (int)strlen(value) && i < 4; i++)
             display[i] = '*';
     } else if (strlen(value) == 0) {
-        safe_strncpy(display, "\xe2\x80\x94", sizeof(display));
+        safe_strncpy(display, "\xe2\x80\x94", sizeof(display)); /* em-dash */
     } else if (strlen(value) > 24) {
         memcpy(display, value, 21);
         strcat(display, "...");
@@ -79,13 +89,12 @@ static void draw_field(float y, const char *label,
         ui_rect(FIELD_X, y + FIELD_H * 0.25f, 3.0f, FIELD_H * 0.5f, COL_LINE1);
 }
 
+/* ---------------------------------------------------------------------------
+ * draw_login_screen
+ * --------------------------------------------------------------------------- */
 static void draw_login_screen(void) {
     ui_frame_begin();
 
-    /*
-     * C2D_TargetClear MUST come before C2D_SceneBegin (ui_target).
-     * Clear both targets upfront, then enter each scene to draw into it.
-     */
     ui_clear_target(ui_get_target(GFX_TOP),    COL_BG);
     ui_clear_target(ui_get_target(GFX_BOTTOM), COL_BG);
 
@@ -98,7 +107,7 @@ static void draw_login_screen(void) {
     ui_rect(0, STRIPE2_Y, SCREEN_TOP_W, STRIPE2_H, COL_LINE2);
 
     float fy = CONTENT_Y;
-    char lbl[80];
+    char  lbl[80];
 
     snprintf(lbl, sizeof(lbl), "Username%s",
              app.current_field == 0 ? "  [A: edit]" : "");
@@ -107,7 +116,8 @@ static void draw_login_screen(void) {
 
     snprintf(lbl, sizeof(lbl), "Pronote QR%s",
              app.current_field == 1 ? "  [A: scan]" : "");
-    const char *qr_val = strlen(app.jeton) > 0 ? "Scanned \xe2\x9c\x93" : "Not scanned";
+    const char *qr_val = strlen(app.jeton) > 0
+                         ? "Scanned \xe2\x9c\x93" : "Not scanned";
     draw_field(fy, lbl, qr_val, 0, app.current_field == 1);
     fy += FIELD_H + FIELD_GAP;
 
@@ -115,11 +125,12 @@ static void draw_login_screen(void) {
              app.current_field == 2 ? "  [A: enter]" : "");
     draw_field(fy, lbl, app.pin, 1, app.current_field == 2);
 
-    ui_rect(0, STATUS_Y, SCREEN_TOP_W, STATUS_H, C2D_Color32(0x00, 0x50, 0x40, 0xCC));
+    ui_rect(0, STATUS_Y, SCREEN_TOP_W, STATUS_H,
+            C2D_Color32(0x00, 0x50, 0x40, 0xCC));
     ui_hline(0, STATUS_Y, SCREEN_TOP_W, COL_LINE2);
     ui_text(8.0f, STATUS_Y + 2.0f, 0.45f, COL_WHITE, app.status_message);
 
-    /* ---- BOTTOM SCREEN ---- */
+    /* ---- BOTTOM SCREEN — controls ---- */
     ui_target(GFX_BOTTOM);
 
     ui_rect(0, 0, SCREEN_BOT_W, HEADER_H, C2D_Color32(0x00, 0x60, 0x52, 0xFF));
@@ -130,11 +141,11 @@ static void draw_login_screen(void) {
     float lsz = 0.50f;
     float lg  = 18.0f;
     const char *keys[] = { "\xe2\x86\x91\xe2\x86\x93", "A", "Y", "X", "START" };
-    const char *desc[] = { "Navigate fields", "Edit / Scan QR",
-                           "Clear field", "Login", "Exit" };
+    const char *descs[] = { "Navigate fields", "Edit / Scan QR",
+                            "Clear field", "Login", "Exit" };
     for (int i = 0; i < 5; i++) {
         ui_text(12.0f, cy, lsz, COL_LINE1, keys[i]);
-        ui_text(44.0f, cy, lsz, COL_WHITE, desc[i]);
+        ui_text(44.0f, cy, lsz, COL_WHITE, descs[i]);
         cy += lg;
     }
     ui_hline(0, SCREEN_H - 3.0f, SCREEN_BOT_W, COL_LINE2);
@@ -143,6 +154,9 @@ static void draw_login_screen(void) {
     ui_frame_end();
 }
 
+/* ---------------------------------------------------------------------------
+ * open_keyboard — swkbd for the active field
+ * --------------------------------------------------------------------------- */
 static void open_keyboard(void) {
     if (app.current_field == 1) {
         app.screen = SCREEN_QR_SCAN;
@@ -159,8 +173,6 @@ static void open_keyboard(void) {
     } else {
         swkbdInit(&swkbd, SWKBD_TYPE_NUMPAD, 1, 4);
         swkbdSetPasswordMode(&swkbd, SWKBD_PASSWORD_HIDE_DELAY);
-        swkbdSetValidation(&swkbd, SWKBD_ANYTHING, 0, 0);
-        swkbdSetFeatures(&swkbd, SWKBD_FIXED_WIDTH);
         swkbdSetHintText(&swkbd, "Enter 4-digit PIN");
         safe_strncpy(tmp, app.pin, sizeof(tmp));
     }
@@ -178,15 +190,12 @@ static void open_keyboard(void) {
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * main
+ * --------------------------------------------------------------------------- */
 int main(int argc, char *argv[]) {
     (void)argc; (void)argv;
 
-    /*
-     * gfxInitDefault() brings up the LCD and GSP service — required first.
-     * C3D_Init() (inside ui_init()) then takes over the GPU command pipe
-     * on top of that. Both are needed; gfxExit() cleans up on exit.
-     * Every official citro2d/citro3d example follows this same order.
-     */
     gfxInitDefault();
     ui_init();
 
@@ -199,6 +208,7 @@ int main(int argc, char *argv[]) {
 
     while (aptMainLoop()) {
 
+        /* ---- QR scan mode ---- */
         if (app.screen == SCREEN_QR_SCAN) {
             char qr_result[MAX_JETON_LEN + MAX_USERNAME_LEN + 64] = {0};
             int  rc = qr_scan(qr_result, sizeof(qr_result));
@@ -206,8 +216,9 @@ int main(int argc, char *argv[]) {
             if (rc == QR_SUCCESS) {
                 char *lp = strstr(qr_result, "\"login\":");
                 char *jp = strstr(qr_result, "\"jeton\":");
+
                 if (lp && jp) {
-                    lp += 9;
+                    lp += 9; /* skip "login":" */
                     char *e = strchr(lp, '"');
                     if (e) {
                         size_t n = (size_t)(e - lp);
@@ -215,7 +226,8 @@ int main(int argc, char *argv[]) {
                         memcpy(app.username, lp, n);
                         app.username[n] = '\0';
                     }
-                    jp += 9;
+
+                    jp += 9; /* skip "jeton":" */
                     e = strchr(jp, '"');
                     if (e) {
                         size_t n = (size_t)(e - jp);
@@ -223,7 +235,8 @@ int main(int argc, char *argv[]) {
                         memcpy(app.jeton, jp, n);
                         app.jeton[n] = '\0';
                     }
-                    safe_strncpy(app.status_message, "QR scanned! Enter your PIN.",
+
+                    safe_strncpy(app.status_message, "QR scanned! Enter PIN.",
                                  sizeof(app.status_message));
                     app.current_field = 2;
                 } else {
@@ -243,6 +256,7 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
+        /* ---- Login screen input ---- */
         hidScanInput();
         u32 kdown = hidKeysDown();
 

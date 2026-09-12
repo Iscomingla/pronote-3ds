@@ -25,6 +25,12 @@
 void ui_init(void);
 void ui_exit(void);
 
+// Suspend/resume citro3d around code that needs exclusive GSP access
+// (e.g. camera DMA). ui_suspend tears down C3D/C2D; ui_resume brings them
+// back up and recreates the render targets.
+void ui_suspend(void);
+void ui_resume(void);
+
 // ---------------------------------------------------------------------------
 // Frame helpers
 // ---------------------------------------------------------------------------
@@ -33,17 +39,12 @@ void ui_frame_end(void);
 
 // ---------------------------------------------------------------------------
 // Target helpers
-// ui_clear_target MUST be called before ui_target for the same screen,
-// because C2D_TargetClear must come before C2D_SceneBegin.
+// ui_clear_target MUST be called before ui_target for the same screen.
 // ---------------------------------------------------------------------------
 C3D_RenderTarget *ui_get_target(gfxScreen_t screen);
 void ui_clear_target(C3D_RenderTarget *t, u32 colour);
-
-// Switch active render target.
 void ui_target(gfxScreen_t screen);
-
-// Fill current target (legacy — prefer ui_clear_target).
-void ui_clear(u32 colour);
+void ui_clear(u32 colour);  // legacy — prefer ui_clear_target
 
 // ---------------------------------------------------------------------------
 // Primitives (call between ui_frame_begin / ui_frame_end)

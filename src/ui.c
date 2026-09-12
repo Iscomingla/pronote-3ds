@@ -7,6 +7,10 @@
  *   ui_clear_target(ui_get_target(GFX_BOTTOM), COL_BG);
  *   ui_target(GFX_TOP);    // draw ...
  *   ui_target(GFX_BOTTOM); // draw ...
+ *
+ * For camera use: call ui_suspend() before camInit(), ui_resume() after
+ * camExit(). This releases the GSP session so the camera sysmodule can
+ * safely DMA into linear heap without causing a kernel panic.
  */
 
 #include "ui.h"
@@ -17,7 +21,7 @@ static C3D_RenderTarget *s_bot  = NULL;
 static C3D_RenderTarget *s_cur  = NULL;
 
 static C2D_TextBuf s_tbuf;
-static C2D_Font    s_font = NULL;   /* NULL = built-in fallback font */
+static C2D_Font    s_font = NULL;
 
 void ui_init(void) {
     C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
@@ -29,19 +33,44 @@ void ui_init(void) {
     s_cur = s_top;
 
     s_tbuf = C2D_TextBufNew(1024);
-
-    /* May return NULL on some firmwares — handled gracefully */
-    s_font = C2D_FontLoadSystem(CFG_REGION_EUR);
+    s_font = C2D_FontLoadSystem(CFG_REGION_EUR); /* NULL handled gracefully */
 }
 
 void ui_exit(void) {
-    if (s_font) {
-        C2D_FontFree(s_font);
-        s_font = NULL;
-    }
+    if (s_font) { C2D_FontFree(s_font); s_font = NULL; }
     C2D_TextBufDelete(s_tbuf);
     C2D_Fini();
     C3D_Fini();
+}
+
+/*
+ * ui_suspend — tear down citro3d/citro2d to release the GSP session.
+ * Call before camInit(). The render targets become invalid after this.
+ */
+void ui_suspend(void) {
+    if (s_font) { C2D_FontFree(s_font); s_font = NULL; }
+    C2D_TextBufDelete(s_tbuf);
+    s_tbuf = NULL;
+    s_top = s_bot = s_cur = NULL;
+    C2D_Fini();
+    C3D_Fini();
+}
+
+/*
+ * ui_resume — reinitialise citro3d/citro2d after camExit().
+ * Render targets are recreated; font is reloaded.
+ */
+void ui_resume(void) {
+    C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
+    C2D_Init(C2D_DEFAULT_MAX_OBJECTS);
+    C2D_Prepare();
+
+    s_top = C2D_CreateScreenTarget(GFX_TOP,    GFX_LEFT);
+    s_bot = C2D_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT);
+    s_cur = s_top;
+
+    s_tbuf = C2D_TextBufNew(1024);
+    s_font = C2D_FontLoadSystem(CFG_REGION_EUR);
 }
 
 void ui_frame_begin(void) {
