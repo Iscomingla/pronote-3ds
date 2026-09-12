@@ -5,10 +5,14 @@
 #include "qr.h"
 #include "../lib/quirc/quirc.h"
 
-// QR scanner using 3DS camera and quirc library
+// QR scanner using 3DS camera and quirc library.
+// Camera setup and buffer handling matches FBI-NH's capturecam.c exactly.
 
 #define CAM_WIDTH  400
 #define CAM_HEIGHT 240
+// Total buffer size matches FBI: width * height * sizeof(u16).
+// transferUnit from CAMU_GetMaxBytes is the line pitch only, not the total.
+#define CAM_BUF_SIZE (CAM_WIDTH * CAM_HEIGHT * sizeof(u16))
 #define FB_BPP 3
 
 static struct quirc *qr_ctx = NULL;
@@ -31,27 +35,26 @@ static void destroy_qr_scanner() {
     }
 }
 
-// Blit RGB565 camera frame to the top-screen framebuffer.
-// The 3DS framebuffer is column-major (portrait). libctru's gfxGetFramebuffer
-// returns fb_w = GSP_SCREEN_WIDTH = 240 (the column height in pixels).
-// pixel (cx, cy) -> fb offset: (cx * fb_w + (fb_w - 1 - cy)) * FB_BPP
-static void blit_camera_to_fb(u8 *fb, const u16 *cam, u16 fb_w) {
+// Blit RGB565 camera buffer (row-major) to the top-screen framebuffer
+// (column-major BGR8, portrait orientation).
+// fb_h = GSP_SCREEN_WIDTH = 240 (column height, from gfxGetFramebuffer).
+// pixel (cx, cy) -> fb offset: (cx * fb_h + (fb_h - 1 - cy)) * FB_BPP
+static void blit_camera_to_fb(u8 *fb, const u16 *cam, u16 fb_h) {
     for (int cy = 0; cy < CAM_HEIGHT; cy++) {
         for (int cx = 0; cx < CAM_WIDTH; cx++) {
             u16 px = cam[cy * CAM_WIDTH + cx];
             u8 r = ((px >> 11) & 0x1F) << 3;
             u8 g = ((px >>  5) & 0x3F) << 2;
             u8 b =  (px        & 0x1F) << 3;
-            // Column-major, y-flipped; libctru uses BGR8
-            u32 off = (cx * fb_w + (fb_w - 1 - cy)) * FB_BPP;
-            fb[off + 0] = b;
+            u32 off = ((u32)cx * fb_h + (fb_h - 1 - cy)) * FB_BPP;
+            fb[off + 0] = b;  // libctru BGR8
             fb[off + 1] = g;
             fb[off + 2] = r;
         }
     }
 }
 
-static void draw_crosshair(u8 *fb, u16 fb_w) {
+static void draw_crosshair(u8 *fb, u16 fb_h) {
     const int cx  = CAM_WIDTH  / 2;
     const int cy  = CAM_HEIGHT / 2;
     const int arm = 28;
@@ -64,7 +67,7 @@ static void draw_crosshair(u8 *fb, u16 fb_w) {
         for (int k = 0; k < 4; k++) {
             int px = coords[k][0], py = coords[k][1];
             if (px < 0 || px >= CAM_WIDTH || py < 0 || py >= CAM_HEIGHT) continue;
-            u32 off = (px * fb_w + (fb_w - 1 - py)) * FB_BPP;
+            u32 off = ((u32)px * fb_h + (fb_h - 1 - py)) * FB_BPP;
             fb[off + 0] = 0;
             fb[off + 1] = 255;
             fb[off + 2] = 0;
@@ -77,7 +80,6 @@ int qr_scan(char *out_buf, size_t out_len) {
 
     gfxSetDoubleBuffering(GFX_TOP, true);
 
-    // Instructions on the bottom screen
     consoleInit(GFX_BOTTOM, NULL);
     consoleClear();
     printf("\x1b[2;0H");
@@ -97,13 +99,13 @@ int qr_scan(char *out_buf, size_t out_len) {
     CAMU_SetAutoWhiteBalance(SELECT_OUT1, true);
     CAMU_Activate(SELECT_OUT1);
 
-    // bufSize = bytes per line (not total). Total buffer = bufSize * CAM_HEIGHT.
-    u32 bufSize = 0;
-    CAMU_GetMaxBytes(&bufSize, CAM_WIDTH, CAM_HEIGHT);
-    CAMU_SetTransferBytes(PORT_CAM1, bufSize, CAM_WIDTH, CAM_HEIGHT);
+    // transferUnit is the line pitch in bytes (CAMU_GetMaxBytes).
+    // Only used as the last argument to CAMU_SetReceiving, matching FBI.
+    u32 transferUnit = 0;
+    CAMU_GetMaxBytes(&transferUnit, CAM_WIDTH, CAM_HEIGHT);
+    CAMU_SetTransferBytes(PORT_CAM1, transferUnit, CAM_WIDTH, CAM_HEIGHT);
 
-    u32 totalSize = bufSize * CAM_HEIGHT;
-    u16 *cam_buf = (u16*)malloc(totalSize);
+    u16 *cam_buf = (u16*)calloc(1, CAM_BUF_SIZE);
     if (!cam_buf) {
         camExit();
         destroy_qr_scanner();
@@ -113,9 +115,9 @@ int qr_scan(char *out_buf, size_t out_len) {
     CAMU_ClearBuffer(PORT_CAM1);
     CAMU_StartCapture(PORT_CAM1);
 
-    // fb_w = GSP_SCREEN_WIDTH = 240 (column height in pixels)
-    u16 fb_w = 0;
-    gfxGetFramebuffer(GFX_TOP, GFX_LEFT, &fb_w, NULL);
+    // fb_h = GSP_SCREEN_WIDTH = 240 (portrait column height)
+    u16 fb_h = 0;
+    gfxGetFramebuffer(GFX_TOP, GFX_LEFT, &fb_h, NULL);
 
     int result = QR_CANCELLED;
 
@@ -128,27 +130,26 @@ int qr_scan(char *out_buf, size_t out_len) {
 
         Handle cam_event = 0;
         svcCreateEvent(&cam_event, RESET_ONESHOT);
-        // totalSize = full buffer; (s16)bufSize = line pitch in bytes
-        CAMU_SetReceiving(&cam_event, cam_buf, PORT_CAM1, totalSize, (s16)bufSize);
+        // CAM_BUF_SIZE = total buffer; transferUnit = line pitch — same as FBI.
+        CAMU_SetReceiving(&cam_event, cam_buf, PORT_CAM1, CAM_BUF_SIZE, (s16)transferUnit);
         svcWaitSynchronization(cam_event, 400000000LL);
         svcCloseHandle(cam_event);
 
         u8 *fb = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, NULL, NULL);
-        blit_camera_to_fb(fb, cam_buf, fb_w);
-        draw_crosshair(fb, fb_w);
+        blit_camera_to_fb(fb, cam_buf, fb_h);
+        draw_crosshair(fb, fb_h);
         gfxFlushBuffers();
         gfxSwapBuffers();
 
-        // Feed grayscale to quirc
+        // Feed grayscale to quirc — same formula as FBI's remoteinstall.c
         int w, h;
         uint8_t *img = quirc_begin(qr_ctx, &w, &h);
         for (int y = 0; y < h; y++) {
             for (int x = 0; x < w; x++) {
                 u16 px = cam_buf[y * CAM_WIDTH + x];
-                u8 r = ((px >> 11) & 0x1F) << 3;
-                u8 g = ((px >>  5) & 0x3F) << 2;
-                u8 b =  (px        & 0x1F) << 3;
-                img[y * w + x] = (u8)(((u16)r + g + b) / 3);
+                img[y * w + x] = (u8)((((px >> 11) & 0x1F) << 3) +
+                                       (((px >>  5) & 0x3F) << 2) +
+                                       ((px & 0x1F) << 3)) / 3;
             }
         }
         quirc_end(qr_ctx);
