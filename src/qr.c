@@ -21,9 +21,11 @@
  * DMA-private buffer) into the shared buffer under mutex. Only the private
  * DMA buffer passed to CAMU_SetReceiving needs to be in linear heap.
  *
- * Stack note: grey_buf (96000 bytes) and the camera thread stack (0x10000)
- * must NOT be on the stack. grey_buf is declared static; the camera thread
- * stack is allocated by threadCreate from the heap.
+ * Stack note: the following are declared static to avoid stack overflow:
+ *   s_grey_buf   — 96000 bytes (400*240 grayscale)
+ *   s_qr_code    — ~3940 bytes (quirc_code with cell_bitmap[3929])
+ *   s_qr_data    — ~8910 bytes (quirc_data with payload[8896])
+ * All three are only ever accessed from the main-thread side of qr_scan.
  */
 
 #include <3ds.h>
@@ -46,12 +48,9 @@
 #define EV_COUNT   3
 
 typedef struct {
-    // Shared between threads; protected by mutex
-    u16    *shared_buf;  // CAM_WIDTH * CAM_HEIGHT * sizeof(u16), calloc
+    u16    *shared_buf;
     Handle  mutex;
-    // Signalled by main thread to stop the camera thread
     Handle  cancel_event;
-    // Set true by camera thread when it exits
     volatile bool finished;
     Result        result;
 } cam_ctx_t;
@@ -63,11 +62,10 @@ static void cam_thread_fn(void *arg) {
     cam_ctx_t *ctx = (cam_ctx_t *)arg;
 
     Handle events[EV_COUNT] = {0};
-    events[EV_CANCEL] = ctx->cancel_event;  // owned by main thread, not closed here
+    events[EV_CANCEL] = ctx->cancel_event;
 
     Result res = 0;
 
-    // Private DMA buffer — must be in linear heap
     u16 *dma_buf = (u16 *)linearAlloc(CAM_BUF_SZ);
     if (!dma_buf) {
         LOG("cam_thread: linearAlloc failed");
@@ -81,7 +79,6 @@ static void cam_thread_fn(void *arg) {
         goto cleanup_linear;
     }
 
-    // Camera configuration — outer camera, full top-screen resolution
     CAMU_SetSize(SELECT_OUT1, SIZE_CTR_TOP_LCD, CONTEXT_A);
     CAMU_SetOutputFormat(SELECT_OUT1, OUTPUT_RGB_565, CONTEXT_A);
     CAMU_SetFrameRate(SELECT_OUT1, FRAME_RATE_30);
@@ -98,7 +95,6 @@ static void cam_thread_fn(void *arg) {
     CAMU_SetTransferBytes(PORT_CAM1, transfer_unit, CAM_WIDTH, CAM_HEIGHT);
     CAMU_ClearBuffer(PORT_CAM1);
 
-    // Arm first receive
     if (R_FAILED(res = CAMU_SetReceiving(&events[EV_RECV], dma_buf,
                                           PORT_CAM1, CAM_BUF_SZ,
                                           (s16)transfer_unit)))
@@ -112,25 +108,19 @@ static void cam_thread_fn(void *arg) {
         res = svcWaitSynchronizationN(&idx, events, EV_COUNT, false, U64_MAX);
         if (R_FAILED(res)) break;
 
-        if (idx == EV_CANCEL) {
-            res = 0;
-            break;
-        }
+        if (idx == EV_CANCEL) { res = 0; break; }
 
         if (idx == EV_RECV) {
-            // Close the old recv handle before re-arming
             svcCloseHandle(events[EV_RECV]);
             events[EV_RECV] = 0;
 
             GSPGPU_InvalidateDataCache(dma_buf, CAM_BUF_SZ);
 
-            // Copy into shared buffer under mutex
             svcWaitSynchronization(ctx->mutex, U64_MAX);
             memcpy(ctx->shared_buf, dma_buf, CAM_BUF_SZ);
             GSPGPU_FlushDataCache(ctx->shared_buf, CAM_BUF_SZ);
             svcReleaseMutex(ctx->mutex);
 
-            // Re-arm — safe because the previous recv event already fired
             res = CAMU_SetReceiving(&events[EV_RECV], dma_buf,
                                      PORT_CAM1, CAM_BUF_SZ, (s16)transfer_unit);
             if (R_FAILED(res)) break;
@@ -140,7 +130,6 @@ static void cam_thread_fn(void *arg) {
             LOG("cam_thread: buffer error — resetting");
             svcCloseHandle(events[EV_RECV]);
             events[EV_RECV] = 0;
-
             if (R_FAILED(res = CAMU_ClearBuffer(PORT_CAM1))) break;
             if (R_FAILED(res = CAMU_SetReceiving(&events[EV_RECV], dma_buf,
                                                   PORT_CAM1, CAM_BUF_SZ,
@@ -150,7 +139,6 @@ static void cam_thread_fn(void *arg) {
     }
 
     CAMU_StopCapture(PORT_CAM1);
-    // Drain — wait until camera is no longer busy
     bool busy = false;
     while (R_SUCCEEDED(CAMU_IsBusy(&busy, PORT_CAM1)) && busy)
         svcSleepThread(1000000);
@@ -162,11 +150,8 @@ cleanup_cam:
 
 cleanup_linear:
     linearFree(dma_buf);
-
-    // Close events owned by this thread
-    for (int i = 1; i < EV_COUNT; i++) {   // skip EV_CANCEL (owned by main)
+    for (int i = 1; i < EV_COUNT; i++)
         if (events[i]) svcCloseHandle(events[i]);
-    }
 
     ctx->result   = res;
     ctx->finished = true;
@@ -174,17 +159,19 @@ cleanup_linear:
 }
 
 // ---------------------------------------------------------------------------
+// Static buffers — must not be on the stack (sizes below):
+//   s_grey_buf : 96 000 bytes
+//   s_qr_code  :  ~3 940 bytes
+//   s_qr_data  :  ~8 910 bytes
+// ---------------------------------------------------------------------------
+static u8               s_grey_buf[CAM_WIDTH * CAM_HEIGHT];
+static struct quirc_code s_qr_code;
+static struct quirc_data s_qr_data;
+
+// ---------------------------------------------------------------------------
 // qr_scan
 // ---------------------------------------------------------------------------
-
-/*
- * 96000 bytes — never put this on the stack.
- * Static: only used from the main loop (single-threaded on this side).
- */
-static u8 s_grey_buf[CAM_WIDTH * CAM_HEIGHT];
-
 int qr_scan(char *out_buf, size_t out_len) {
-    // Allocate context
     cam_ctx_t *ctx = (cam_ctx_t *)calloc(1, sizeof(cam_ctx_t));
     if (!ctx) return QR_ERROR;
 
@@ -200,7 +187,6 @@ int qr_scan(char *out_buf, size_t out_len) {
     }
     ctx->finished = false;
 
-    // quirc context
     struct quirc *qrc = quirc_new();
     if (!qrc || quirc_resize(qrc, CAM_WIDTH, CAM_HEIGHT) < 0) {
         if (qrc) quirc_destroy(qrc);
@@ -210,10 +196,8 @@ int qr_scan(char *out_buf, size_t out_len) {
         return QR_ERROR;
     }
 
-    // Initialise camera texture
     ui_cam_tex_init();
 
-    // Start camera thread (priority 0x1A like FBI, stack 0x10000)
     Thread cam_thread = threadCreate(cam_thread_fn, ctx, 0x10000, 0x1A, 0, true);
     if (!cam_thread) {
         LOG("qr_scan: threadCreate failed");
@@ -235,14 +219,10 @@ int qr_scan(char *out_buf, size_t out_len) {
             break;
         }
 
-        // ------ citro2d frame ------
         ui_frame_begin();
-
-        // Clear both targets
         ui_clear_target(ui_get_target(GFX_TOP),    COL_BLACK);
         ui_clear_target(ui_get_target(GFX_BOTTOM), COL_BG);
 
-        // Upload + draw camera frame on top screen
         svcWaitSynchronization(ctx->mutex, U64_MAX);
         ui_cam_tex_upload(ctx->shared_buf, CAM_WIDTH, CAM_HEIGHT);
         svcReleaseMutex(ctx->mutex);
@@ -250,15 +230,12 @@ int qr_scan(char *out_buf, size_t out_len) {
         ui_target(GFX_TOP);
         ui_cam_tex_draw(0.0f, 0.0f, (float)SCREEN_TOP_W, (float)SCREEN_H);
 
-        // Crosshair
         float cx  = SCREEN_TOP_W / 2.0f;
         float cy  = SCREEN_H      / 2.0f;
-        float arm = 28.0f;
-        float gap  = 7.0f;
+        float arm = 28.0f, gap = 7.0f;
         ui_rect(cx - arm, cy - 1.0f, (arm - gap) * 2.0f, 2.0f, COL_LINE1);
         ui_rect(cx - 1.0f, cy - arm, 2.0f, (arm - gap) * 2.0f, COL_LINE1);
 
-        // Bottom screen instructions
         ui_target(GFX_BOTTOM);
         ui_rect(0, 0, SCREEN_BOT_W, 36.0f, C2D_Color32(0x00, 0x60, 0x52, 0xFF));
         ui_text_centred(0, SCREEN_BOT_W, 8.0f, 0.65f, COL_WHITE, "QR Scanner");
@@ -274,9 +251,8 @@ int qr_scan(char *out_buf, size_t out_len) {
         ui_hline(0, SCREEN_H - 1.0f, SCREEN_BOT_W, COL_LINE1);
 
         ui_frame_end();
-        // ------ end citro2d frame ------
 
-        // quirc decode — copy shared buffer under mutex, then decode outside mutex
+        // Grayscale conversion
         svcWaitSynchronization(ctx->mutex, U64_MAX);
         const u16 *src = ctx->shared_buf;
         for (int i = 0; i < CAM_WIDTH * CAM_HEIGHT; i++) {
@@ -297,14 +273,12 @@ int qr_scan(char *out_buf, size_t out_len) {
         if (n > 0) LOG("qr_scan: frame %d — %d code(s) detected", frames, n);
 
         for (int i = 0; i < n; i++) {
-            struct quirc_code code;
-            struct quirc_data data;
-            quirc_extract(qrc, i, &code);
-            if (quirc_decode(&code, &data) == QUIRC_SUCCESS) {
-                LOG("qr_scan: decoded on frame %d, len=%d", frames, data.payload_len);
-                size_t len = data.payload_len;
+            quirc_extract(qrc, i, &s_qr_code);
+            if (quirc_decode(&s_qr_code, &s_qr_data) == QUIRC_SUCCESS) {
+                LOG("qr_scan: decoded on frame %d, len=%d", frames, s_qr_data.payload_len);
+                size_t len = s_qr_data.payload_len;
                 if (len >= out_len) len = out_len - 1;
-                memcpy(out_buf, data.payload, len);
+                memcpy(out_buf, s_qr_data.payload, len);
                 out_buf[len] = '\0';
                 result = QR_SUCCESS;
                 svcSignalEvent(ctx->cancel_event);
@@ -316,8 +290,7 @@ int qr_scan(char *out_buf, size_t out_len) {
     }
 
 done:
-    // Wait for camera thread to finish
-    svcSignalEvent(ctx->cancel_event);  // idempotent if already signalled
+    svcSignalEvent(ctx->cancel_event);
     while (!ctx->finished)
         svcSleepThread(1000000);
 
