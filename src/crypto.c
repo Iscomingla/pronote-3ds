@@ -16,6 +16,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <stddef.h>
 
 /* Decode a single hex nibble; returns -1 on invalid char */
 static int hexnibble(char c) {
