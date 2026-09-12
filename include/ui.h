@@ -20,48 +20,37 @@
 #define SCREEN_H        240
 
 // ---------------------------------------------------------------------------
-// Lifecycle — call once at startup / shutdown
+// Lifecycle
 // ---------------------------------------------------------------------------
 void ui_init(void);
 void ui_exit(void);
 
+// Suspend/resume citro3d around code that needs exclusive GSP access
+// (e.g. camera DMA). ui_suspend tears down C3D/C2D; ui_resume brings them
+// back up and recreates the render targets.
+void ui_suspend(void);
+void ui_resume(void);
+
 // ---------------------------------------------------------------------------
 // Frame helpers
-// Call ui_frame_begin() at the start of each render pass.
-// Call ui_frame_end()   to flush both screens.
 // ---------------------------------------------------------------------------
 void ui_frame_begin(void);
 void ui_frame_end(void);
 
 // ---------------------------------------------------------------------------
-// Primitive drawing (must be called between ui_frame_begin / ui_frame_end)
+// Target helpers
+// ui_clear_target MUST be called before ui_target for the same screen.
 // ---------------------------------------------------------------------------
-
-// Switch active render target.  screen = GFX_TOP or GFX_BOTTOM.
-void ui_target(gfxScreen_t screen);
-
-// Get the underlying C3D_RenderTarget for a screen (for ui_clear_target).
 C3D_RenderTarget *ui_get_target(gfxScreen_t screen);
-
-// Clear a specific render target (call BEFORE ui_target for that screen,
-// because C2D_TargetClear must come before C2D_SceneBegin).
 void ui_clear_target(C3D_RenderTarget *t, u32 colour);
+void ui_target(gfxScreen_t screen);
+void ui_clear(u32 colour);  // legacy — prefer ui_clear_target
 
-// Fill the whole current target with a solid colour (legacy, prefer ui_clear_target).
-void ui_clear(u32 colour);
-
-// Filled rectangle.
-void ui_rect(float x, float y, float w, float h, u32 colour);
-
-// Horizontal line (1 px tall).
-void ui_hline(float x, float y, float len, u32 colour);
-
-// Draw UTF-8 text using the built-in system font.
-// size: 0.5f = small, 0.6f = normal, 0.7f = large
-void ui_text(float x, float y, float size, u32 colour, const char *str);
-
-// Measure text width (for centering).
+// ---------------------------------------------------------------------------
+// Primitives (call between ui_frame_begin / ui_frame_end)
+// ---------------------------------------------------------------------------
+void  ui_rect(float x, float y, float w, float h, u32 colour);
+void  ui_hline(float x, float y, float len, u32 colour);
+void  ui_text(float x, float y, float size, u32 colour, const char *str);
 float ui_text_width(float size, const char *str);
-
-// Draw text centred in [x, x+w].
-void ui_text_centred(float x, float w, float y, float size, u32 colour, const char *str);
+void  ui_text_centred(float x, float w, float y, float size, u32 colour, const char *str);
