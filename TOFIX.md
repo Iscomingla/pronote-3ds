@@ -1,6 +1,10 @@
 # TOFIX
 
-- [ ] QR decode fails with QUIRC_ERROR_DATA_ECC (error 4) on Pronote v13/v14 QR codes:
-      2x2 downsample to 200x120 still too low resolution (~2.9px/module for v14).
-      Fix: try multiple downsample scales (4x4, 3x3, 2x2) per frame + local
-      adaptive threshold instead of global Otsu.
+- [ ] QR decode still failing after multi-scale + adaptive threshold attempt:
+      - 4x/3x scales never detect codes (too small for finder pattern detection)
+      - Adaptive threshold causes FORMAT_ECC (error 3) by corrupting format strips
+      - Mutex held during processing causes camera DMA buffer errors
+      Fix:
+        1. Copy frame under mutex, release before processing
+        2. Drop adaptive threshold — use raw greyscale, let quirc Otsu run
+        3. Keep only 2x scale (only one that detects); add 1x (full 400x240) as fallback
