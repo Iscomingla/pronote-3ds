@@ -6,13 +6,9 @@
 #include "network.h"
 #include "qr.h"
 
-/*
- * The jeton is a hex-encoded AES-CBC ciphertext.
- * No documented protocol upper bound; 512 chars is safe headroom.
- */
 #define MAX_USERNAME_LEN  64
-#define MAX_JETON_LEN    513   /* 512 usable chars + null */
-#define MAX_PIN            5   /* 4 digits + null */
+#define MAX_JETON_LEN    513
+#define MAX_PIN            5
 
 typedef enum {
     SCREEN_LOGIN,
@@ -24,7 +20,7 @@ typedef struct {
     char   jeton[MAX_JETON_LEN];
     char   pin[MAX_PIN];
     char   uuid[37];
-    int    current_field;   /* 0: username  1: QR/jeton  2: pin */
+    int    current_field;
     int    logged_in;
     char   status_message[128];
     int    needs_redraw;
@@ -33,9 +29,6 @@ typedef struct {
 
 static AppState app;
 
-/* -------------------------------------------------------------------------
- * Helpers
- * ---------------------------------------------------------------------- */
 static void safe_strncpy(char *dest, const char *src, size_t maxlen) {
     if (!dest || !src || maxlen == 0) return;
     size_t len = strlen(src);
@@ -44,21 +37,16 @@ static void safe_strncpy(char *dest, const char *src, size_t maxlen) {
     dest[len] = '\0';
 }
 
-/* -------------------------------------------------------------------------
- * Login screen layout
- * ---------------------------------------------------------------------- */
 #define HEADER_H   36.0f
 #define STRIPE1_Y  (HEADER_H)
 #define STRIPE1_H   4.0f
 #define STRIPE2_Y  (STRIPE1_Y + STRIPE1_H)
 #define STRIPE2_H   2.0f
 #define CONTENT_Y  (STRIPE2_Y + STRIPE2_H + 12.0f)
-
 #define FIELD_H    34.0f
 #define FIELD_GAP   8.0f
 #define FIELD_X    16.0f
 #define FIELD_W    (SCREEN_TOP_W - FIELD_X * 2.0f)
-
 #define STATUS_H   18.0f
 #define STATUS_Y   (SCREEN_H - STATUS_H)
 
@@ -76,7 +64,7 @@ static void draw_field(float y, const char *label,
         for (int i = 0; i < (int)strlen(value) && i < 4; i++)
             display[i] = '*';
     } else if (strlen(value) == 0) {
-        safe_strncpy(display, "\xe2\x80\x94", sizeof(display)); /* em-dash */
+        safe_strncpy(display, "\xe2\x80\x94", sizeof(display));
     } else if (strlen(value) > 24) {
         memcpy(display, value, 21);
         strcat(display, "...");
@@ -94,9 +82,15 @@ static void draw_field(float y, const char *label,
 static void draw_login_screen(void) {
     ui_frame_begin();
 
+    /*
+     * C2D_TargetClear MUST come before C2D_SceneBegin (ui_target).
+     * Clear both targets upfront, then enter each scene to draw into it.
+     */
+    ui_clear_target(ui_get_target(GFX_TOP),    COL_BG);
+    ui_clear_target(ui_get_target(GFX_BOTTOM), COL_BG);
+
     /* ---- TOP SCREEN ---- */
     ui_target(GFX_TOP);
-    ui_clear(COL_BG);
 
     ui_rect(0, 0, SCREEN_TOP_W, HEADER_H, C2D_Color32(0x00, 0x60, 0x52, 0xFF));
     ui_text_centred(0, SCREEN_TOP_W, 8.0f, 0.65f, COL_WHITE, "notApro");
@@ -113,9 +107,7 @@ static void draw_login_screen(void) {
 
     snprintf(lbl, sizeof(lbl), "Pronote QR%s",
              app.current_field == 1 ? "  [A: scan]" : "");
-    const char *qr_val = strlen(app.jeton) > 0
-                         ? "Scanned \xe2\x9c\x93"
-                         : "Not scanned";
+    const char *qr_val = strlen(app.jeton) > 0 ? "Scanned \xe2\x9c\x93" : "Not scanned";
     draw_field(fy, lbl, qr_val, 0, app.current_field == 1);
     fy += FIELD_H + FIELD_GAP;
 
@@ -123,14 +115,13 @@ static void draw_login_screen(void) {
              app.current_field == 2 ? "  [A: enter]" : "");
     draw_field(fy, lbl, app.pin, 1, app.current_field == 2);
 
-    ui_rect(0, STATUS_Y, SCREEN_TOP_W, STATUS_H,
-            C2D_Color32(0x00, 0x50, 0x40, 0xCC));
+    ui_rect(0, STATUS_Y, SCREEN_TOP_W, STATUS_H, C2D_Color32(0x00, 0x50, 0x40, 0xCC));
     ui_hline(0, STATUS_Y, SCREEN_TOP_W, COL_LINE2);
     ui_text(8.0f, STATUS_Y + 2.0f, 0.45f, COL_WHITE, app.status_message);
 
     /* ---- BOTTOM SCREEN — controls ---- */
     ui_target(GFX_BOTTOM);
-    ui_clear(COL_BG);
+
     ui_rect(0, 0, SCREEN_BOT_W, HEADER_H, C2D_Color32(0x00, 0x60, 0x52, 0xFF));
     ui_text_centred(0, SCREEN_BOT_W, 8.0f, 0.65f, COL_WHITE, "Controls");
     ui_hline(0, HEADER_H, SCREEN_BOT_W, COL_LINE1);
@@ -152,9 +143,6 @@ static void draw_login_screen(void) {
     ui_frame_end();
 }
 
-/* -------------------------------------------------------------------------
- * Keyboard / field edit
- * ---------------------------------------------------------------------- */
 static void open_keyboard(void) {
     if (app.current_field == 1) {
         app.screen = SCREEN_QR_SCAN;
@@ -190,19 +178,16 @@ static void open_keyboard(void) {
     }
 }
 
-/* -------------------------------------------------------------------------
- * main
- * ---------------------------------------------------------------------- */
 int main(int argc, char *argv[]) {
     (void)argc; (void)argv;
 
     /*
-     * Do NOT call gfxInitDefault() here.
-     * ui_init() calls C3D_Init() which initialises GSP/GPU ownership
-     * and allocates its own framebuffers via citro3d. Calling gfxInitDefault()
-     * first would double-init GSP and corrupt framebuffer state. Similarly,
-     * gfxExit() must not be called on exit — ui_exit() handles teardown.
+     * gfxInitDefault() brings up the LCD and GSP service — required first.
+     * C3D_Init() (inside ui_init()) then takes over the GPU command pipe
+     * on top of that. Both are needed; gfxExit() cleans up on exit.
+     * Every official citro2d/citro3d example follows this same order.
      */
+    gfxInitDefault();
     ui_init();
 
     memset(&app, 0, sizeof(AppState));
@@ -214,14 +199,10 @@ int main(int argc, char *argv[]) {
 
     while (aptMainLoop()) {
 
-        /* ---- QR scan mode ---- */
         if (app.screen == SCREEN_QR_SCAN) {
             char qr_result[MAX_JETON_LEN + MAX_USERNAME_LEN + 64] = {0};
             int  rc = qr_scan(qr_result, sizeof(qr_result));
-            /*
-             * citro2d is still alive after qr_scan() returns — no reinit
-             * needed. Just update state and redraw.
-             */
+
             if (rc == QR_SUCCESS) {
                 char *lp = strstr(qr_result, "\"login\":");
                 char *jp = strstr(qr_result, "\"jeton\":");
@@ -262,7 +243,6 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        /* ---- Login screen input ---- */
         hidScanInput();
         u32 kdown = hidKeysDown();
 
@@ -313,5 +293,6 @@ int main(int argc, char *argv[]) {
     }
 
     ui_exit();
+    gfxExit();
     return 0;
 }
