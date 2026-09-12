@@ -10,7 +10,7 @@
 
 #define CAM_WIDTH  400
 #define CAM_HEIGHT 240
-// Total buffer size matches FBI: width * height * sizeof(u16).
+// Total buffer size: width * height * sizeof(u16).
 // transferUnit from CAMU_GetMaxBytes is the line pitch only, not the total.
 #define CAM_BUF_SIZE (CAM_WIDTH * CAM_HEIGHT * sizeof(u16))
 #define FB_BPP 3
@@ -130,10 +130,18 @@ int qr_scan(char *out_buf, size_t out_len) {
 
         Handle cam_event = 0;
         svcCreateEvent(&cam_event, RESET_ONESHOT);
-        // CAM_BUF_SIZE = total buffer; transferUnit = line pitch — same as FBI.
+
+        // Flush CPU cache before handing buffer to DMA so the DMA engine
+        // doesn't see dirty cache lines being written back over its data.
+        GSPGPU_FlushDataCache(cam_buf, CAM_BUF_SIZE);
+
         CAMU_SetReceiving(&cam_event, cam_buf, PORT_CAM1, CAM_BUF_SIZE, (s16)transferUnit);
         svcWaitSynchronization(cam_event, 400000000LL);
         svcCloseHandle(cam_event);
+
+        // Invalidate CPU cache after DMA completes so the CPU reads the
+        // freshly DMA-written data instead of stale cached zeros.
+        GSPGPU_InvalidateDataCache(cam_buf, CAM_BUF_SIZE);
 
         u8 *fb = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, NULL, NULL);
         blit_camera_to_fb(fb, cam_buf, fb_h);
@@ -141,7 +149,7 @@ int qr_scan(char *out_buf, size_t out_len) {
         gfxFlushBuffers();
         gfxSwapBuffers();
 
-        // Feed grayscale to quirc — same formula as FBI's remoteinstall.c
+        // Feed grayscale to quirc
         int w, h;
         uint8_t *img = quirc_begin(qr_ctx, &w, &h);
         for (int y = 0; y < h; y++) {
