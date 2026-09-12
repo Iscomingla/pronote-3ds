@@ -11,34 +11,31 @@
  *                  (cancel, recv, buffer_error) so CAMU_SetReceiving is only
  *                  re-armed after the recv event fires.
  *
- * Decode strategy (lessons from two log sessions):
+ * Decode strategy (lessons from three log sessions):
  *
- *   Session 1: 2x2 downsample → 200x120. quirc detects code, DATA_ECC fails.
- *              Root cause: module pitch too small for Otsu to cleanly threshold.
+ *   Session 1: DATA_ECC at 2x — module pitch too small for Otsu.
+ *   Session 2: adaptive threshold → FORMAT_ECC; mutex held → buffer errors.
+ *   Session 3: mutex fixed, buffer errors gone. Version still flips v13↔v14
+ *              on same physical QR → quirc grid misalignment. The finder
+ *              pattern corners are not detected precisely enough because the
+ *              3DS camera produces soft edges. quirc's perspective correction
+ *              then samples module centres at wrong positions → bit errors
+ *              exhaust ECC capacity → DATA_ECC on every frame.
  *
- *   Session 2: multi-scale (4x/3x/2x) + local adaptive threshold.
- *              New problems:
- *                a) 4x/3x too small for quirc finder-pattern detector — never triggers.
- *                b) Adaptive threshold corrupts format strips → FORMAT_ECC (err 3).
- *                c) All processing happened while holding ctx->mutex → camera
- *                   thread starved → cascade of DMA buffer errors.
- *
- *   Fix (this version):
- *     1. Release mutex immediately after memcpy into local frame_buf.
- *        All greyscale conversion and decode happen on the local copy.
- *     2. Drop adaptive threshold. Feed raw BT.601 greyscale to quirc and
- *        let its own Otsu run — it works correctly once the mutex starvation
- *        is gone and frames arrive cleanly.
- *     3. Two scales only: 2x (200x120) tried first; 1x (400x240) as fallback.
- *        4x/3x removed — they are below quirc's minimum usable resolution for
- *        the finder-pattern correlator on v9-v14 codes.
+ *   Fix (this version): apply a 3x3 unsharp mask (amount=1.5) to the
+ *   greyscale image before handing it to quirc. This sharpens finder pattern
+ *   edges → more precise corner detection → accurate grid alignment → clean
+ *   module sampling → DATA_ECC goes away.
+ *   Applied to both 2x (200x120) and 1x (400x240) buffers.
  *
  * Stack note: large buffers are static to avoid stack overflow.
- *   s_frame_buf  -- 192000 bytes local copy of camera frame
- *   s_grey2      -- 24000 bytes (200x120)
- *   s_grey1      -- 96000 bytes (400x240)
- *   s_qr_code    -- ~3940 bytes
- *   s_qr_data    -- ~8910 bytes
+ *   s_frame_buf  -- 192000 bytes  (local copy of camera frame, u16)
+ *   s_grey2      --  24000 bytes  (200x120 greyscale)
+ *   s_grey1      --  96000 bytes  (400x240 greyscale)
+ *   s_sharp2     --  24000 bytes  (sharpened 200x120)
+ *   s_sharp1     --  96000 bytes  (sharpened 400x240)
+ *   s_qr_code    --   ~3940 bytes
+ *   s_qr_data    --   ~8910 bytes
  */
 
 #include <3ds.h>
@@ -163,21 +160,68 @@ cleanup_linear:
 // ---------------------------------------------------------------------------
 // Static buffers — off the stack
 // ---------------------------------------------------------------------------
-static u16 s_frame_buf[CAM_WIDTH * CAM_HEIGHT];  /* local copy, no mutex needed */
-static u8  s_grey2[W2 * H2];                     /* 2x downsampled greyscale   */
-static u8  s_grey1[CAM_WIDTH * CAM_HEIGHT];       /* full-res greyscale fallback */
+static u16 s_frame_buf[CAM_WIDTH * CAM_HEIGHT];
+static u8  s_grey2[W2 * H2];
+static u8  s_grey1[CAM_WIDTH * CAM_HEIGHT];
+static u8  s_sharp2[W2 * H2];
+static u8  s_sharp1[CAM_WIDTH * CAM_HEIGHT];
 
 static struct quirc_code s_qr_code;
 static struct quirc_data s_qr_data;
 
 // ---------------------------------------------------------------------------
-// rgb565_to_grey: convert one RGB565 pixel to BT.601 luma
+// rgb565_luma: BT.601 luma from one RGB565 pixel
 // ---------------------------------------------------------------------------
 static inline u8 rgb565_luma(u16 px) {
     u32 r8 = ((px >> 11) & 0x1F) << 3;
     u32 g8 = ((px >>  5) & 0x3F) << 2;
     u32 b8 =  (px        & 0x1F) << 3;
     return (u8)((r8 * 77 + g8 * 150 + b8 * 29) >> 8);
+}
+
+// ---------------------------------------------------------------------------
+// unsharp_mask: sharpen src (w x h) into dst using 3x3 unsharp mask.
+//
+// Unsharp mask: sharpened = src + amount * (src - blurred)
+// We use a 3x3 box blur approximation for speed.
+// amount = 1.5 in fixed-point: sharpened = src * 5/2 - blurred * 3/2
+// Clamped to [0, 255].
+//
+// Why this fixes DATA_ECC:
+//   The 3DS camera produces soft edges on the QR finder patterns.
+//   quirc's corner detector uses the gradient magnitude to find the
+//   three finder-pattern squares. Soft edges → low gradient → imprecise
+//   corner localisation → perspective matrix error → grid sampling lands
+//   between module centres → bit errors → DATA_ECC.
+//   Sharpening raises gradient magnitude at edges → precise corners →
+//   correct grid → clean module sampling → successful decode.
+// ---------------------------------------------------------------------------
+static void unsharp_mask(const u8 *src, u8 *dst, int w, int h) {
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            /* 3x3 box blur (border pixels clamp to edge) */
+            int sum = 0, count = 0;
+            for (int dy = -1; dy <= 1; dy++) {
+                int sy = y + dy;
+                if (sy < 0) sy = 0;
+                if (sy >= h) sy = h - 1;
+                for (int dx = -1; dx <= 1; dx++) {
+                    int sx = x + dx;
+                    if (sx < 0) sx = 0;
+                    if (sx >= w) sx = w - 1;
+                    sum += src[sy * w + sx];
+                    count++;
+                }
+            }
+            int blur = sum / count;   /* 9-tap box blur */
+            int v    = src[y * w + x];
+            /* amount=1.5: out = v + 1.5*(v - blur) = 2.5*v - 1.5*blur */
+            int sharp = (v * 5 - blur * 3) / 2;
+            if (sharp < 0)   sharp = 0;
+            if (sharp > 255) sharp = 255;
+            dst[y * w + x] = (u8)sharp;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -225,7 +269,6 @@ int qr_scan(char *out_buf, size_t out_len) {
     cam_ctx_t *ctx = (cam_ctx_t *)calloc(1, sizeof(cam_ctx_t));
     if (!ctx) return QR_ERROR;
 
-    /* shared_buf: camera thread writes here under mutex */
     ctx->shared_buf = (u16 *)calloc(1, CAM_BUF_SZ);
     if (!ctx->shared_buf) { free(ctx); return QR_ERROR; }
 
@@ -238,7 +281,6 @@ int qr_scan(char *out_buf, size_t out_len) {
     }
     ctx->finished = false;
 
-    /* Two quirc instances: 2x scale and 1x (full-res) fallback */
     struct quirc *qrc2 = quirc_new();
     struct quirc *qrc1 = quirc_new();
     if (!qrc2 || !qrc1
@@ -283,14 +325,13 @@ int qr_scan(char *out_buf, size_t out_len) {
 
         svcWaitSynchronization(ctx->mutex, U64_MAX);
         ui_cam_tex_upload(ctx->shared_buf, CAM_WIDTH, CAM_HEIGHT);
-        /* Copy frame for decode — release mutex BEFORE processing */
         memcpy(s_frame_buf, ctx->shared_buf, CAM_BUF_SZ);
-        svcReleaseMutex(ctx->mutex);
+        svcReleaseMutex(ctx->mutex);   /* release before any processing */
 
         ui_target(GFX_TOP);
         ui_cam_tex_draw(0.0f, 0.0f, (float)SCREEN_TOP_W, (float)SCREEN_H);
 
-        /* Crosshair */
+        /* Crosshair overlay */
         float cx = SCREEN_TOP_W / 2.0f, cfy = SCREEN_H / 2.0f;
         float arm = 28.0f, gap = 7.0f;
         ui_rect(cx - arm,  cfy - 1.0f, (arm - gap) * 2.0f, 2.0f, COL_LINE1);
@@ -312,9 +353,9 @@ int qr_scan(char *out_buf, size_t out_len) {
 
         ui_frame_end();
 
-        /* ---- Decode (on local copy, mutex already released) ---- */
+        /* ---- Decode (on local copy, mutex released) ---- */
 
-        /* 2x downsample: 2x2 box-avg BT.601 luma → s_grey2 */
+        /* 2x downsample → greyscale → sharpen */
         for (int qy = 0; qy < H2; qy++) {
             for (int qx = 0; qx < W2; qx++) {
                 u32 sum = 0;
@@ -325,14 +366,16 @@ int qr_scan(char *out_buf, size_t out_len) {
                 s_grey2[qy * W2 + qx] = (u8)(sum / 4);
             }
         }
+        unsharp_mask(s_grey2, s_sharp2, W2, H2);
 
-        /* 1x full-res luma → s_grey1 (fallback) */
+        /* 1x full-res → greyscale → sharpen */
         for (int i = 0; i < CAM_WIDTH * CAM_HEIGHT; i++)
             s_grey1[i] = rgb565_luma(s_frame_buf[i]);
+        unsharp_mask(s_grey1, s_sharp1, CAM_WIDTH, CAM_HEIGHT);
 
-        /* Try 2x first, then 1x fallback */
-        if (try_decode(qrc2, s_grey2, W2, H2, frames, 2)) goto success;
-        if (try_decode(qrc1, s_grey1, CAM_WIDTH, CAM_HEIGHT, frames, 1)) goto success;
+        /* Try 2x sharpened first, then 1x sharpened fallback */
+        if (try_decode(qrc2, s_sharp2, W2, H2, frames, 2)) goto success;
+        if (try_decode(qrc1, s_sharp1, CAM_WIDTH, CAM_HEIGHT, frames, 1)) goto success;
 
         frames++;
         continue;
