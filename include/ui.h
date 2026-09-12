@@ -3,21 +3,28 @@
 #include <citro2d.h>
 
 // ---------------------------------------------------------------------------
-// Pronote colour palette
-// C2D_Color32(r, g, b, a)
+// Pronote colour palette — C2D_Color32(r, g, b, a)
 // ---------------------------------------------------------------------------
 #define COL_BG       C2D_Color32(0x00, 0x86, 0x73, 0xFF)  // #008673 teal
 #define COL_LINE1    C2D_Color32(0xFF, 0xCD, 0x05, 0xFF)  // #FFCD05 gold
 #define COL_LINE2    C2D_Color32(0x94, 0xCC, 0x7A, 0xFF)  // #94CC7A light green
 #define COL_WHITE    C2D_Color32(0xFF, 0xFF, 0xFF, 0xFF)
 #define COL_BLACK    C2D_Color32(0x00, 0x00, 0x00, 0xFF)
-#define COL_SELECTED C2D_Color32(0xFF, 0xFF, 0xFF, 0x30)  // translucent white highlight
-#define COL_DIMTEXT  C2D_Color32(0x94, 0xCC, 0x7A, 0xAA)  // muted #94CC7A for labels
+#define COL_SELECTED C2D_Color32(0xFF, 0xFF, 0xFF, 0x30)
+#define COL_DIMTEXT  C2D_Color32(0x94, 0xCC, 0x7A, 0xAA)
 
-// Top screen: 400x240   Bottom screen: 320x240
+// Screen dimensions
 #define SCREEN_TOP_W    400
 #define SCREEN_BOT_W    320
 #define SCREEN_H        240
+
+// ---------------------------------------------------------------------------
+// Camera preview texture
+// The GPU requires textures to be power-of-two and Morton (tile) encoded.
+// CAM_TEX_W/H are the next pow2 >= CAM_WIDTH/HEIGHT (400->512, 240->256).
+// ---------------------------------------------------------------------------
+#define CAM_TEX_W  512
+#define CAM_TEX_H  256
 
 // ---------------------------------------------------------------------------
 // Lifecycle
@@ -25,9 +32,9 @@
 void ui_init(void);
 void ui_exit(void);
 
-// Suspend/resume citro3d around code that needs exclusive GSP access
-// (e.g. camera DMA). ui_suspend tears down C3D/C2D; ui_resume brings them
-// back up and recreates the render targets.
+// ui_suspend / ui_resume are kept for any caller that still needs them,
+// but qr.c no longer uses them — the camera thread approach does not
+// conflict with citro3d.
 void ui_suspend(void);
 void ui_resume(void);
 
@@ -44,7 +51,25 @@ void ui_frame_end(void);
 C3D_RenderTarget *ui_get_target(gfxScreen_t screen);
 void ui_clear_target(C3D_RenderTarget *t, u32 colour);
 void ui_target(gfxScreen_t screen);
-void ui_clear(u32 colour);  // legacy — prefer ui_clear_target
+void ui_clear(u32 colour);  // legacy
+
+// ---------------------------------------------------------------------------
+// Camera preview texture
+//
+// ui_cam_tex_upload(src, w, h)
+//   Upload an RGB565 row-major buffer (width*height*2 bytes) into the camera
+//   preview texture, applying Morton (tile) encoding as the GPU requires.
+//   Must be called inside a ui_frame_begin / ui_frame_end pair.
+//
+// ui_cam_tex_draw(x, y, w, h)
+//   Draw the previously uploaded camera texture at (x,y) scaled to (w x h).
+//   Must be called inside a ui_frame_begin / ui_frame_end pair, after
+//   ui_target() has been called for the desired screen.
+// ---------------------------------------------------------------------------
+void ui_cam_tex_init(void);
+void ui_cam_tex_free(void);
+void ui_cam_tex_upload(const u16 *src, int src_w, int src_h);
+void ui_cam_tex_draw(float x, float y, float w, float h);
 
 // ---------------------------------------------------------------------------
 // Primitives (call between ui_frame_begin / ui_frame_end)
