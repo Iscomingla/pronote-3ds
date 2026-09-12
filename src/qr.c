@@ -1,3 +1,14 @@
+/*
+ * qr.c — QR code scanner using 3DS outer camera + quirc.
+ *
+ * Camera display is intentionally omitted here — will be re-added
+ * once the UI switches to citro2d/citro3d (see TODO: camera preview).
+ *
+ * Event model: RESET_STICKY, re-armed after every received frame.
+ * This matches the FBI-NH capturecam approach and avoids the pitfalls
+ * of creating a fresh RESET_ONESHOT event on every iteration.
+ */
+
 #include <3ds.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -5,56 +16,49 @@
 #include "qr.h"
 #include "../lib/quirc/quirc.h"
 
-// QR scanner using 3DS camera and quirc library.
-// Camera display is intentionally omitted here — it will be re-added
-// once the UI switches to citro2d/citro3d (see TODO: camera preview).
+#define CAM_WIDTH   400
+#define CAM_HEIGHT  240
+#define CAM_BUF_SZ  (CAM_WIDTH * CAM_HEIGHT * sizeof(u16))
 
-#define CAM_WIDTH  400
-#define CAM_HEIGHT 240
-// Total buffer size: width * height * sizeof(u16).
-// transferUnit from CAMU_GetMaxBytes is the line pitch only, not the total.
-#define CAM_BUF_SIZE (CAM_WIDTH * CAM_HEIGHT * sizeof(u16))
-
-static struct quirc *qr_ctx = NULL;
-
-static int init_qr_scanner() {
-    qr_ctx = quirc_new();
-    if (!qr_ctx) return -1;
-    if (quirc_resize(qr_ctx, CAM_WIDTH, CAM_HEIGHT) < 0) {
-        quirc_destroy(qr_ctx);
-        qr_ctx = NULL;
-        return -1;
-    }
-    return 0;
-}
-
-static void destroy_qr_scanner() {
-    if (qr_ctx) {
-        quirc_destroy(qr_ctx);
-        qr_ctx = NULL;
-    }
-}
+/* Frame-receive timeout: ~2 s at 30 fps is generous. */
+#define RECV_TIMEOUT_NS  2000000000LL
 
 int qr_scan(char *out_buf, size_t out_len) {
-    if (init_qr_scanner() != 0) return QR_ERROR;
+    /* --- quirc init -------------------------------------------------- */
+    struct quirc *qrc = quirc_new();
+    if (!qrc) return QR_ERROR;
+    if (quirc_resize(qrc, CAM_WIDTH, CAM_HEIGHT) < 0) {
+        quirc_destroy(qrc);
+        return QR_ERROR;
+    }
 
-    // Instructions on bottom screen
+    /* --- frame buffer ------------------------------------------------- */
+    u16 *cam_buf = (u16 *)calloc(1, CAM_BUF_SZ);
+    if (!cam_buf) {
+        quirc_destroy(qrc);
+        return QR_ERROR;
+    }
+
+    /* --- UI: instructions on bottom screen ---------------------------- */
     consoleInit(GFX_BOTTOM, NULL);
     consoleClear();
     printf("\x1b[2;0H");
     printf("=== QR CODE SCANNER ===\n\n");
-    printf("Point camera at your\n");
-    printf("Pronote QR code.\n\n");
+    printf("Point the outer camera at\n");
+    printf("your Pronote QR code.\n\n");
     printf("B: Cancel\n");
     gfxFlushBuffers();
     gfxSwapBuffers();
 
-    // Top screen: plain black while scanning (no preview yet)
-    consoleClear();
-    gfxFlushBuffers();
-    gfxSwapBuffers();
+    /* --- camera init -------------------------------------------------- */
+    Result res = camInit();
+    if (R_FAILED(res)) {
+        free(cam_buf);
+        quirc_destroy(qrc);
+        consoleInit(GFX_TOP, NULL);
+        return QR_ERROR;
+    }
 
-    camInit();
     CAMU_SetSize(SELECT_OUT1, SIZE_CTR_TOP_LCD, CONTEXT_A);
     CAMU_SetOutputFormat(SELECT_OUT1, OUTPUT_RGB_565, CONTEXT_A);
     CAMU_SetFrameRate(SELECT_OUT1, FRAME_RATE_30);
@@ -65,76 +69,76 @@ int qr_scan(char *out_buf, size_t out_len) {
 
     u32 transferUnit = 0;
     CAMU_GetMaxBytes(&transferUnit, CAM_WIDTH, CAM_HEIGHT);
+    CAMU_SetTrimming(PORT_CAM1, false);
     CAMU_SetTransferBytes(PORT_CAM1, transferUnit, CAM_WIDTH, CAM_HEIGHT);
 
-    u16 *cam_buf = (u16*)calloc(1, CAM_BUF_SIZE);
-    if (!cam_buf) {
-        camExit();
-        destroy_qr_scanner();
-        return QR_ERROR;
-    }
+    /* RESET_STICKY: signal stays set until we clear it, so we never miss
+       a frame between CAMU_SetReceiving and svcWaitSynchronization. */
+    Handle recv_event = 0;
+    svcCreateEvent(&recv_event, RESET_STICKY);
 
     CAMU_ClearBuffer(PORT_CAM1);
+    CAMU_SetReceiving(&recv_event, cam_buf, PORT_CAM1, CAM_BUF_SZ, (s16)transferUnit);
     CAMU_StartCapture(PORT_CAM1);
 
     int result = QR_CANCELLED;
 
     while (aptMainLoop()) {
         hidScanInput();
-        if (hidKeysDown() & KEY_B) {
-            result = QR_CANCELLED;
-            break;
-        }
+        if (hidKeysDown() & KEY_B) break;
 
-        Handle cam_event = 0;
-        svcCreateEvent(&cam_event, RESET_ONESHOT);
+        /* Wait for next frame (or timeout) */
+        res = svcWaitSynchronization(recv_event, RECV_TIMEOUT_NS);
+        if (R_FAILED(res)) continue; /* timeout — try again */
+        svcClearEvent(recv_event);   /* re-arm for the next frame */
 
-        // Flush before DMA write, invalidate after — required for cache coherency.
-        GSPGPU_FlushDataCache(cam_buf, CAM_BUF_SIZE);
-        CAMU_SetReceiving(&cam_event, cam_buf, PORT_CAM1, CAM_BUF_SIZE, (s16)transferUnit);
-        svcWaitSynchronization(cam_event, 400000000LL);
-        svcCloseHandle(cam_event);
-        GSPGPU_InvalidateDataCache(cam_buf, CAM_BUF_SIZE);
+        /* Flush cache so quirc reads the DMA'd data */
+        GSPGPU_InvalidateDataCache(cam_buf, CAM_BUF_SZ);
 
-        // Feed grayscale to quirc
-        int w, h;
-        uint8_t *img = quirc_begin(qr_ctx, &w, &h);
+        /* Re-arm camera for next frame immediately */
+        CAMU_SetReceiving(&recv_event, cam_buf, PORT_CAM1, CAM_BUF_SZ, (s16)transferUnit);
+
+        /* Convert RGB565 frame to greyscale for quirc */
+        int w = 0, h = 0;
+        uint8_t *img = quirc_begin(qrc, &w, &h);
         for (int y = 0; y < h; y++) {
             for (int x = 0; x < w; x++) {
                 u16 px = cam_buf[y * CAM_WIDTH + x];
-                img[y * w + x] = (u8)((((px >> 11) & 0x1F) << 3) +
-                                       (((px >>  5) & 0x3F) << 2) +
-                                       ((px & 0x1F) << 3)) / 3;
+                img[y * w + x] = (u8)(
+                    (((px >> 11) & 0x1F) * 8 +
+                     ((px >>  5) & 0x3F) * 4 +
+                      (px        & 0x1F) * 8) / 3);
             }
         }
-        quirc_end(qr_ctx);
+        quirc_end(qrc);
 
-        int num = quirc_count(qr_ctx);
-        if (num > 0) {
+        int n = quirc_count(qrc);
+        for (int i = 0; i < n; i++) {
             struct quirc_code code;
             struct quirc_data data;
-            quirc_extract(qr_ctx, 0, &code);
+            quirc_extract(qrc, i, &code);
             if (quirc_decode(&code, &data) == QUIRC_SUCCESS) {
                 size_t copy_len = data.payload_len;
                 if (copy_len >= out_len) copy_len = out_len - 1;
                 memcpy(out_buf, data.payload, copy_len);
                 out_buf[copy_len] = '\0';
                 result = QR_SUCCESS;
-                break;
+                goto done;
             }
         }
 
         gspWaitForVBlank();
     }
 
+done:
     CAMU_StopCapture(PORT_CAM1);
     CAMU_Activate(SELECT_NONE);
+    svcCloseHandle(recv_event);
     free(cam_buf);
     camExit();
-    destroy_qr_scanner();
+    quirc_destroy(qrc);
 
-    // Restore top screen for login UI
+    /* Restore top screen for login UI */
     consoleInit(GFX_TOP, NULL);
-
     return result;
 }
