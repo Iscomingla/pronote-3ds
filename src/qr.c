@@ -12,14 +12,18 @@
  *                  so CAMU_SetReceiving is only re-armed after the recv event
  *                  fires — never while the previous DMA is in flight.
  *
- * Buffer layout:
- *   SIZE_CTR_TOP_LCD with OUTPUT_RGB_565 gives a plain row-major 400x240
- *   buffer. pixel (x,y) is at buf[y * CAM_WIDTH + x].
- *   However the outer camera outputs a horizontally mirrored image.
- *   quirc finds the finder patterns but samples cells on the wrong side,
- *   so quirc_decode returns QUIRC_ERROR_DATA_ECC (error 4) every time.
- *   Fix: on ECC failure, call quirc_flip() and retry — this handles the
- *   ISO 18004:2015 mirror case and is how FBI-NH resolves the same issue.
+ * Greyscale conversion:
+ *   RGB565 -> luma using ITU-R BT.601 integer weights (same as libyuv):
+ *     Y = (R5*77 + G6*150 + B5*29) >> 8   (approximate 0.299R+0.587G+0.114B)
+ *   This gives better contrast than the equal-weight average used previously,
+ *   which is important for high-density QR codes (version 10+) where cells
+ *   are only a few pixels wide.
+ *
+ * Mirror handling:
+ *   The 3DS outer camera outputs a horizontally mirrored image. On the first
+ *   ECC failure we try quirc_flip() (ISO 18004:2015 mirror correction). We
+ *   log both the original and post-flip error codes so we can diagnose which
+ *   orientation actually gets further.
  *
  * Stack note: the following are declared static to avoid stack overflow:
  *   s_grey_buf   — 96000 bytes (400*240 grayscale)
@@ -125,7 +129,7 @@ static void cam_thread_fn(void *arg) {
         }
 
         if (idx == EV_BUFERR) {
-            LOG("cam_thread: buffer error — resetting");
+            LOG("cam_thread: buffer error, resetting");
             svcCloseHandle(events[EV_RECV]);
             events[EV_RECV] = 0;
             if (R_FAILED(res = CAMU_ClearBuffer(PORT_CAM1))) break;
@@ -157,7 +161,7 @@ cleanup_linear:
 }
 
 // ---------------------------------------------------------------------------
-// Static buffers — keep off the stack
+// Static buffers -- keep off the stack
 // ---------------------------------------------------------------------------
 static u8                s_grey_buf[CAM_WIDTH * CAM_HEIGHT];
 static struct quirc_code s_qr_code;
@@ -248,15 +252,18 @@ int qr_scan(char *out_buf, size_t out_len) {
 
         ui_frame_end();
 
-        // RGB565 -> greyscale, plain row-major (same as FBI)
+        // RGB565 -> greyscale using BT.601 luma weights (better contrast than
+        // equal-weight average, especially for high-density QR codes)
+        //   R5 -> R8 via << 3,  G6 -> G8 via << 2,  B5 -> B8 via << 3
+        //   Y = (R8*77 + G8*150 + B8*29) >> 8   (sums to 256)
         svcWaitSynchronization(ctx->mutex, U64_MAX);
         const u16 *src = ctx->shared_buf;
         for (int i = 0; i < CAM_WIDTH * CAM_HEIGHT; i++) {
-            u16 px = src[i];
-            s_grey_buf[i] = (u8)(
-                ((((px >> 11) & 0x1F) << 3) +
-                 (((px >>  5) & 0x3F) << 2) +
-                  ((px        & 0x1F) << 3)) / 3);
+            u16 px  = src[i];
+            u32 r8  = ((px >> 11) & 0x1F) << 3;
+            u32 g8  = ((px >>  5) & 0x3F) << 2;
+            u32 b8  =  (px        & 0x1F) << 3;
+            s_grey_buf[i] = (u8)((r8 * 77 + g8 * 150 + b8 * 29) >> 8);
         }
         svcReleaseMutex(ctx->mutex);
 
@@ -266,31 +273,37 @@ int qr_scan(char *out_buf, size_t out_len) {
         quirc_end(qrc);
 
         int n = quirc_count(qrc);
-        if (n > 0) LOG("qr_scan: frame %d — %d code(s) detected", frames, n);
+        if (n > 0) LOG("qr_scan: frame %d -- %d code(s) detected", frames, n);
 
         for (int i = 0; i < n; i++) {
             quirc_extract(qrc, i, &s_qr_code);
 
-            // Try normal decode first
-            quirc_decode_error_t err = quirc_decode(&s_qr_code, &s_qr_data);
-            if (err == QUIRC_ERROR_DATA_ECC) {
-                // Outer camera outputs a mirrored image; try flipped decode
-                quirc_flip(&s_qr_code);
-                err = quirc_decode(&s_qr_code, &s_qr_data);
-            }
+            // Log QR size once per detection burst so we know the version
+            LOG("qr_scan: frame %d code %d size=%d (version %d)",
+                frames, i, s_qr_code.size, (s_qr_code.size - 17) / 4);
 
-            if (err == QUIRC_SUCCESS) {
-                LOG("qr_scan: decoded on frame %d, len=%d", frames, s_qr_data.payload_len);
-                size_t len = s_qr_data.payload_len;
-                if (len >= out_len) len = out_len - 1;
-                memcpy(out_buf, s_qr_data.payload, len);
-                out_buf[len] = '\0';
-                result = QR_SUCCESS;
-                svcSignalEvent(ctx->cancel_event);
-                goto done;
-            } else {
-                LOG("qr_scan: frame %d code %d decode error after flip: %d", frames, i, (int)err);
-            }
+            quirc_decode_error_t err = quirc_decode(&s_qr_code, &s_qr_data);
+            if (err == QUIRC_SUCCESS) goto success;
+
+            LOG("qr_scan: frame %d code %d normal decode error: %d", frames, i, (int)err);
+
+            // Try mirrored decode (outer camera outputs horizontally flipped image)
+            quirc_flip(&s_qr_code);
+            err = quirc_decode(&s_qr_code, &s_qr_data);
+            if (err == QUIRC_SUCCESS) goto success;
+
+            LOG("qr_scan: frame %d code %d flipped decode error: %d", frames, i, (int)err);
+            continue;
+
+success:
+            LOG("qr_scan: decoded on frame %d, len=%d", frames, s_qr_data.payload_len);
+            size_t len = s_qr_data.payload_len;
+            if (len >= out_len) len = out_len - 1;
+            memcpy(out_buf, s_qr_data.payload, len);
+            out_buf[len] = '\0';
+            result = QR_SUCCESS;
+            svcSignalEvent(ctx->cancel_event);
+            goto done;
         }
 
         frames++;
