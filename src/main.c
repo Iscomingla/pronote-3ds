@@ -30,6 +30,12 @@
 #define STATUS_H    18.0f
 #define STATUS_Y    (SCREEN_H - STATUS_H)
 
+/* Controls column layout — key label left-aligned at KEY_X,
+   description left-aligned at DESC_X. DESC_X must clear the widest
+   key label ("START" at size 0.50f ≈ 52 px) plus a small gap. */
+#define CTRL_KEY_X   12.0f
+#define CTRL_DESC_X  64.0f
+
 typedef enum {
     SCREEN_LOGIN,
     SCREEN_QR_SCAN,
@@ -144,8 +150,8 @@ static void draw_login_screen(void) {
     const char *descs[] = { "Navigate fields", "Edit / Scan QR",
                             "Clear field", "Login", "Exit app" };
     for (int i = 0; i < 5; i++) {
-        ui_text(12.0f, cy, lsz, COL_LINE1, keys[i]);
-        ui_text(44.0f, cy, lsz, COL_WHITE, descs[i]);
+        ui_text(CTRL_KEY_X,  cy, lsz, COL_LINE1, keys[i]);
+        ui_text(CTRL_DESC_X, cy, lsz, COL_WHITE, descs[i]);
         cy += lg;
     }
     ui_hline(0, SCREEN_H - 3.0f, SCREEN_BOT_W, COL_LINE2);
