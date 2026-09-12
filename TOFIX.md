@@ -21,4 +21,9 @@
 2. `C2D_FontLoadSystem` return value not checked — NULL font crashes on some firmwares.
 3. `LIBDIRS` missing citro2d/citro3d lib path — linker may pick wrong lib versions.
 
-**Fix in progress.**
+**GDB debbuging result:**
+```
+Ignoring packet error, continuing...
+warning: unrecognized item "timeout" in "qSupported" response
+Remote replied unexpectedly to 'vMustReplyEmpty': PacketSize=400;qXfer:features:read+;qXfer:osdata:read+;QStartNoAckMode+;QThreadEvents+;QCatchSyscalls+;vContSupported+;swbreak+;multiprocess+
+```
