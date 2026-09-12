@@ -39,7 +39,7 @@
 
 /* "Hold B" at size 0.50f is ~56 px wide; add 8 px gap → desc at 80.0f */
 #define QR_BTN_X   16.0f
-#define QR_DESC_X  80.0f
+#define QR_DESC_X  65.0f
 
 static void draw_qr_screen(void) {
     ui_frame_begin();
