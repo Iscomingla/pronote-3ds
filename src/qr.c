@@ -20,6 +20,10 @@
  * the camera thread immediately memcpy's the DMA output (which lands in the
  * DMA-private buffer) into the shared buffer under mutex. Only the private
  * DMA buffer passed to CAMU_SetReceiving needs to be in linear heap.
+ *
+ * Stack note: grey_buf (96000 bytes) and the camera thread stack (0x10000)
+ * must NOT be on the stack. grey_buf is declared static; the camera thread
+ * stack is allocated by threadCreate from the heap.
  */
 
 #include <3ds.h>
@@ -172,6 +176,13 @@ cleanup_linear:
 // ---------------------------------------------------------------------------
 // qr_scan
 // ---------------------------------------------------------------------------
+
+/*
+ * 96000 bytes — never put this on the stack.
+ * Static: only used from the main loop (single-threaded on this side).
+ */
+static u8 s_grey_buf[CAM_WIDTH * CAM_HEIGHT];
+
 int qr_scan(char *out_buf, size_t out_len) {
     // Allocate context
     cam_ctx_t *ctx = (cam_ctx_t *)calloc(1, sizeof(cam_ctx_t));
@@ -240,8 +251,8 @@ int qr_scan(char *out_buf, size_t out_len) {
         ui_cam_tex_draw(0.0f, 0.0f, (float)SCREEN_TOP_W, (float)SCREEN_H);
 
         // Crosshair
-        float cx = SCREEN_TOP_W / 2.0f;
-        float cy = SCREEN_H      / 2.0f;
+        float cx  = SCREEN_TOP_W / 2.0f;
+        float cy  = SCREEN_H      / 2.0f;
         float arm = 28.0f;
         float gap  = 7.0f;
         ui_rect(cx - arm, cy - 1.0f, (arm - gap) * 2.0f, 2.0f, COL_LINE1);
@@ -265,13 +276,12 @@ int qr_scan(char *out_buf, size_t out_len) {
         ui_frame_end();
         // ------ end citro2d frame ------
 
-        // quirc decode on the shared buffer (snapshot copy avoids holding mutex during decode)
-        u8 grey_buf[CAM_WIDTH * CAM_HEIGHT];
+        // quirc decode — copy shared buffer under mutex, then decode outside mutex
         svcWaitSynchronization(ctx->mutex, U64_MAX);
         const u16 *src = ctx->shared_buf;
         for (int i = 0; i < CAM_WIDTH * CAM_HEIGHT; i++) {
             u16 px = src[i];
-            grey_buf[i] = (u8)(
+            s_grey_buf[i] = (u8)(
                 (((px >> 11) & 0x1F) * 8 +
                  ((px >>  5) & 0x3F) * 4 +
                   (px        & 0x1F) * 8) / 3);
@@ -280,7 +290,7 @@ int qr_scan(char *out_buf, size_t out_len) {
 
         int w = 0, h = 0;
         uint8_t *qimg = quirc_begin(qrc, &w, &h);
-        memcpy(qimg, grey_buf, (size_t)w * h);
+        memcpy(qimg, s_grey_buf, (size_t)w * h);
         quirc_end(qrc);
 
         int n = quirc_count(qrc);
