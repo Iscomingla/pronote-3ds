@@ -4,7 +4,7 @@ Planned features, roughly in implementation order.
 
 ## 🔐 Authentication
 
-- [ ] **PIN decryption of jeton** — decrypt the jeton from the QR code using the 4-digit PIN (AES-CBC, key = MD5(pin), IV = all zeroes — see PRONOTE protocol)
+- [x] **PIN decryption of jeton** — decrypt the jeton from the QR code using the 4-digit PIN (AES-CBC, key = MD5(pin), IV = all zeroes — see PRONOTE protocol)
 - [ ] **HTTP login request** — send decrypted credentials to the Pronote API endpoint
 - [ ] **Session persistence** — save session cookie to SD card so re-login isn't needed every time
 - [ ] **Secure credential storage** — encrypt saved credentials at rest
@@ -37,6 +37,6 @@ Planned features, roughly in implementation order.
 ## 🌍 Misc
 
 - [ ] **French/English UI strings** — i18n support
-- [ ] **File-based logging** — write debug log to SD card (`pronote_log.txt`)
+- [x] **File-based logging** — write debug log to SD card (`sdmc:/3ds/notApro/log.txt`)
 - [ ] **Error recovery** — user-friendly messages for network/auth failures
 - [ ] **CIA packaging** — proper metadata + banner for installable CIA
