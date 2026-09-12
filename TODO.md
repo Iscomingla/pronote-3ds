@@ -26,6 +26,7 @@ Planned features, roughly in implementation order.
 
 ## 🖥️ UI
 
+- [ ] **Switch to citro2d/citro3d** — replace the current console-based UI with a proper GPU-accelerated GUI (citro2d for 2D rendering, citro3d for lower-level GPU access); enables textures, sprites, smooth layouts, and camera preview via GPU texture upload
 - [ ] **Dual-screen layout** — login/nav on bottom screen, content on top
 - [ ] **Scrollable output** — scroll through content longer than one screen
 - [ ] **Loading screen** — progress bar during network requests
