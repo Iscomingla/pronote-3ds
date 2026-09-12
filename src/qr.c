@@ -3,32 +3,29 @@
  *
  * Architecture (modelled on FBI-NH's remoteinstall.c + capturecam.c):
  *
- *   Main thread:  citro2d render loop — uploads camera frame as GPU texture
+ *   Main thread:  citro2d render loop -- uploads camera frame as GPU texture
  *                 each frame, decodes with quirc, handles B-cancel.
  *
- *   Camera thread: CAMU DMA loop — captures frames into a shared u16* buffer
+ *   Camera thread: CAMU DMA loop -- captures frames into a shared u16* buffer
  *                  protected by a mutex. Uses svcWaitSynchronizationN across
  *                  three events (cancel, recv, buffer_error) like FBI does,
  *                  so CAMU_SetReceiving is only re-armed after the recv event
- *                  fires — never while the previous DMA is in flight.
+ *                  fires -- never while the previous DMA is in flight.
  *
- * Greyscale conversion:
- *   RGB565 -> luma using ITU-R BT.601 integer weights (same as libyuv):
- *     Y = (R5*77 + G6*150 + B5*29) >> 8   (approximate 0.299R+0.587G+0.114B)
- *   This gives better contrast than the equal-weight average used previously,
- *   which is important for high-density QR codes (version 10+) where cells
- *   are only a few pixels wide.
+ * Resolution strategy:
+ *   The Pronote QR is version 14 (73x73 modules). At 400x240 that is only
+ *   ~3px per module vertically, which is too little for quirc's Otsu
+ *   thresholder to reliably separate black from white cells.
  *
- * Mirror handling:
- *   The 3DS outer camera outputs a horizontally mirrored image. On the first
- *   ECC failure we try quirc_flip() (ISO 18004:2015 mirror correction). We
- *   log both the original and post-flip error codes so we can diagnose which
- *   orientation actually gets further.
+ *   Fix: feed quirc at half resolution (200x120) by 2x2 box-averaging when
+ *   converting to greyscale. This doubles the effective module size to ~6px
+ *   and makes Otsu work correctly. The camera preview still uses the full
+ *   400x240 buffer so the display is unaffected.
  *
  * Stack note: the following are declared static to avoid stack overflow:
- *   s_grey_buf   — 96000 bytes (400*240 grayscale)
- *   s_qr_code    — ~3940 bytes (quirc_code with cell_bitmap[3929])
- *   s_qr_data    — ~8910 bytes (quirc_data with payload[8896])
+ *   s_grey_buf  -- 24000 bytes (200*120 greyscale, half-res)
+ *   s_qr_code   -- ~3940 bytes
+ *   s_qr_data   -- ~8910 bytes
  */
 
 #include <3ds.h>
@@ -40,9 +37,13 @@
 #include "log.h"
 #include "../lib/quirc/quirc.h"
 
-#define CAM_WIDTH   400
-#define CAM_HEIGHT  240
-#define CAM_BUF_SZ  (CAM_WIDTH * CAM_HEIGHT * sizeof(u16))
+#define CAM_WIDTH    400
+#define CAM_HEIGHT   240
+#define CAM_BUF_SZ   (CAM_WIDTH * CAM_HEIGHT * sizeof(u16))
+
+/* Half-resolution quirc input */
+#define QR_WIDTH     (CAM_WIDTH  / 2)   /* 200 */
+#define QR_HEIGHT    (CAM_HEIGHT / 2)   /* 120 */
 
 #define EV_CANCEL  0
 #define EV_RECV    1
@@ -163,7 +164,7 @@ cleanup_linear:
 // ---------------------------------------------------------------------------
 // Static buffers -- keep off the stack
 // ---------------------------------------------------------------------------
-static u8                s_grey_buf[CAM_WIDTH * CAM_HEIGHT];
+static u8                s_grey_buf[QR_WIDTH * QR_HEIGHT];  /* 200x120 */
 static struct quirc_code s_qr_code;
 static struct quirc_data s_qr_data;
 
@@ -186,8 +187,9 @@ int qr_scan(char *out_buf, size_t out_len) {
     }
     ctx->finished = false;
 
+    /* quirc at half resolution */
     struct quirc *qrc = quirc_new();
-    if (!qrc || quirc_resize(qrc, CAM_WIDTH, CAM_HEIGHT) < 0) {
+    if (!qrc || quirc_resize(qrc, QR_WIDTH, QR_HEIGHT) < 0) {
         if (qrc) quirc_destroy(qrc);
         svcCloseHandle(ctx->cancel_event);
         svcCloseHandle(ctx->mutex);
@@ -222,6 +224,7 @@ int qr_scan(char *out_buf, size_t out_len) {
         ui_clear_target(ui_get_target(GFX_TOP),    COL_BLACK);
         ui_clear_target(ui_get_target(GFX_BOTTOM), COL_BG);
 
+        /* Upload full-res frame for display */
         svcWaitSynchronization(ctx->mutex, U64_MAX);
         ui_cam_tex_upload(ctx->shared_buf, CAM_WIDTH, CAM_HEIGHT);
         svcReleaseMutex(ctx->mutex);
@@ -229,7 +232,7 @@ int qr_scan(char *out_buf, size_t out_len) {
         ui_target(GFX_TOP);
         ui_cam_tex_draw(0.0f, 0.0f, (float)SCREEN_TOP_W, (float)SCREEN_H);
 
-        // Crosshair overlay
+        /* Crosshair overlay */
         float cx  = SCREEN_TOP_W / 2.0f;
         float cy  = SCREEN_H      / 2.0f;
         float arm = 28.0f, gap = 7.0f;
@@ -252,18 +255,28 @@ int qr_scan(char *out_buf, size_t out_len) {
 
         ui_frame_end();
 
-        // RGB565 -> greyscale using BT.601 luma weights (better contrast than
-        // equal-weight average, especially for high-density QR codes)
-        //   R5 -> R8 via << 3,  G6 -> G8 via << 2,  B5 -> B8 via << 3
-        //   Y = (R8*77 + G8*150 + B8*29) >> 8   (sums to 256)
+        /*
+         * Downsample 400x240 -> 200x120 with 2x2 box average + BT.601 luma.
+         * Each output pixel averages the 4 source pixels at (2x, 2y),
+         * (2x+1, 2y), (2x, 2y+1), (2x+1, 2y+1).
+         * This doubles the effective module size for quirc's Otsu threshold.
+         */
         svcWaitSynchronization(ctx->mutex, U64_MAX);
         const u16 *src = ctx->shared_buf;
-        for (int i = 0; i < CAM_WIDTH * CAM_HEIGHT; i++) {
-            u16 px  = src[i];
-            u32 r8  = ((px >> 11) & 0x1F) << 3;
-            u32 g8  = ((px >>  5) & 0x3F) << 2;
-            u32 b8  =  (px        & 0x1F) << 3;
-            s_grey_buf[i] = (u8)((r8 * 77 + g8 * 150 + b8 * 29) >> 8);
+        for (int qy = 0; qy < QR_HEIGHT; qy++) {
+            for (int qx = 0; qx < QR_WIDTH; qx++) {
+                u32 sum = 0;
+                for (int dy = 0; dy < 2; dy++) {
+                    for (int dx = 0; dx < 2; dx++) {
+                        u16 px = src[(qy * 2 + dy) * CAM_WIDTH + (qx * 2 + dx)];
+                        u32 r8 = ((px >> 11) & 0x1F) << 3;
+                        u32 g8 = ((px >>  5) & 0x3F) << 2;
+                        u32 b8 =  (px        & 0x1F) << 3;
+                        sum += (r8 * 77 + g8 * 150 + b8 * 29) >> 8;
+                    }
+                }
+                s_grey_buf[qy * QR_WIDTH + qx] = (u8)(sum / 4);
+            }
         }
         svcReleaseMutex(ctx->mutex);
 
@@ -278,7 +291,6 @@ int qr_scan(char *out_buf, size_t out_len) {
         for (int i = 0; i < n; i++) {
             quirc_extract(qrc, i, &s_qr_code);
 
-            // Log QR size once per detection burst so we know the version
             LOG("qr_scan: frame %d code %d size=%d (version %d)",
                 frames, i, s_qr_code.size, (s_qr_code.size - 17) / 4);
 
@@ -287,7 +299,6 @@ int qr_scan(char *out_buf, size_t out_len) {
 
             LOG("qr_scan: frame %d code %d normal decode error: %d", frames, i, (int)err);
 
-            // Try mirrored decode (outer camera outputs horizontally flipped image)
             quirc_flip(&s_qr_code);
             err = quirc_decode(&s_qr_code, &s_qr_data);
             if (err == QUIRC_SUCCESS) goto success;
