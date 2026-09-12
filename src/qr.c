@@ -10,10 +10,10 @@
  */
 
 #include <3ds.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "qr.h"
+#include "ui.h"
 #include "../lib/quirc/quirc.h"
 
 #define CAM_WIDTH   400
@@ -81,6 +81,16 @@ int qr_scan(char *out_buf, size_t out_len) {
     CAMU_SetReceiving(&recv_event, cam_buf, PORT_CAM1, CAM_BUF_SZ, (s16)transferUnit);
     CAMU_StartCapture(PORT_CAM1);
 
+    /* 6. Capture loop
+     *
+     * Key discipline: create a fresh RESET_ONESHOT event every iteration.
+     * svcWaitSynchronization on a RESET_ONESHOT atomically clears it when it
+     * returns, so the transfer is guaranteed complete before we touch cam_buf
+     * or call CAMU_SetReceiving again. No svcClearEvent needed.
+     *
+     * We also flush the CPU cache before arming so the DMA engine sees a clean
+     * buffer, then invalidate after the wait so the CPU sees fresh pixel data.
+     */
     int result = QR_CANCELLED;
 
     while (aptMainLoop()) {
@@ -118,16 +128,14 @@ int qr_scan(char *out_buf, size_t out_len) {
             struct quirc_data data;
             quirc_extract(qrc, i, &code);
             if (quirc_decode(&code, &data) == QUIRC_SUCCESS) {
-                size_t copy_len = data.payload_len;
-                if (copy_len >= out_len) copy_len = out_len - 1;
-                memcpy(out_buf, data.payload, copy_len);
-                out_buf[copy_len] = '\0';
+                size_t len = data.payload_len;
+                if (len >= out_len) len = out_len - 1;
+                memcpy(out_buf, data.payload, len);
+                out_buf[len] = '\0';
                 result = QR_SUCCESS;
                 goto done;
             }
         }
-
-        gspWaitForVBlank();
     }
 
 done:

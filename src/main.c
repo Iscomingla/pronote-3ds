@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "ui.h"
 #include "network.h"
 #include "qr.h"
 
@@ -31,7 +32,7 @@ typedef struct {
     Screen screen;
 } AppState;
 
-AppState app_state;
+static AppState app;
 
 static void safe_strncpy(char *dest, const char *src, size_t maxlen) {
     if (!dest || !src || maxlen == 0) return;
@@ -65,19 +66,75 @@ static void draw_login_ui(void) {
     if (app_state.current_field == 2)
         printf("  (4 digits)\n");
 
-    printf("\n--- CONTROLS ---\n");
-    printf("UP/DOWN: Navigate fields\n");
-    if (app_state.current_field == 1)
-        printf("A: Scan QR with camera\n");
-    else
-        printf("A: Edit field\n");
-    printf("Y: Clear field\n");
-    printf("X: Login\n");
-    printf("START: Exit\n\n");
-    printf("Status: %s\n", app_state.status_message);
+    u32 val_col = strlen(value) == 0 ? COL_DIMTEXT : COL_WHITE;
+    ui_text(FIELD_X + 8.0f, y + 16.0f, 0.55f, val_col, display);
 
-    gfxFlushBuffers();
-    gfxSwapBuffers();
+    if (selected)
+        ui_rect(FIELD_X, y + FIELD_H * 0.25f, 3.0f, FIELD_H * 0.5f, COL_LINE1);
+}
+
+static void draw_login_screen(void) {
+    ui_frame_begin();
+
+    /*
+     * C2D_TargetClear MUST come before C2D_SceneBegin (ui_target).
+     * Clear both targets upfront, then enter each scene to draw into it.
+     */
+    ui_clear_target(ui_get_target(GFX_TOP),    COL_BG);
+    ui_clear_target(ui_get_target(GFX_BOTTOM), COL_BG);
+
+    /* ---- TOP SCREEN ---- */
+    ui_target(GFX_TOP);
+
+    ui_rect(0, 0, SCREEN_TOP_W, HEADER_H, C2D_Color32(0x00, 0x60, 0x52, 0xFF));
+    ui_text_centred(0, SCREEN_TOP_W, 8.0f, 0.65f, COL_WHITE, "notApro");
+    ui_rect(0, STRIPE1_Y, SCREEN_TOP_W, STRIPE1_H, COL_LINE1);
+    ui_rect(0, STRIPE2_Y, SCREEN_TOP_W, STRIPE2_H, COL_LINE2);
+
+    float fy = CONTENT_Y;
+    char lbl[80];
+
+    snprintf(lbl, sizeof(lbl), "Username%s",
+             app.current_field == 0 ? "  [A: edit]" : "");
+    draw_field(fy, lbl, app.username, 0, app.current_field == 0);
+    fy += FIELD_H + FIELD_GAP;
+
+    snprintf(lbl, sizeof(lbl), "Pronote QR%s",
+             app.current_field == 1 ? "  [A: scan]" : "");
+    const char *qr_val = strlen(app.jeton) > 0 ? "Scanned \xe2\x9c\x93" : "Not scanned";
+    draw_field(fy, lbl, qr_val, 0, app.current_field == 1);
+    fy += FIELD_H + FIELD_GAP;
+
+    snprintf(lbl, sizeof(lbl), "PIN code (4 digits)%s",
+             app.current_field == 2 ? "  [A: enter]" : "");
+    draw_field(fy, lbl, app.pin, 1, app.current_field == 2);
+
+    ui_rect(0, STATUS_Y, SCREEN_TOP_W, STATUS_H, C2D_Color32(0x00, 0x50, 0x40, 0xCC));
+    ui_hline(0, STATUS_Y, SCREEN_TOP_W, COL_LINE2);
+    ui_text(8.0f, STATUS_Y + 2.0f, 0.45f, COL_WHITE, app.status_message);
+
+    /* ---- BOTTOM SCREEN — controls ---- */
+    ui_target(GFX_BOTTOM);
+
+    ui_rect(0, 0, SCREEN_BOT_W, HEADER_H, C2D_Color32(0x00, 0x60, 0x52, 0xFF));
+    ui_text_centred(0, SCREEN_BOT_W, 8.0f, 0.65f, COL_WHITE, "Controls");
+    ui_hline(0, HEADER_H, SCREEN_BOT_W, COL_LINE1);
+
+    float cy  = HEADER_H + 10.0f;
+    float lsz = 0.50f;
+    float lg  = 18.0f;
+    const char *keys[] = { "\xe2\x86\x91\xe2\x86\x93", "A", "Y", "X", "START" };
+    const char *desc[] = { "Navigate fields", "Edit / Scan QR",
+                           "Clear field", "Login", "Exit" };
+    for (int i = 0; i < 5; i++) {
+        ui_text(12.0f, cy, lsz, COL_LINE1, keys[i]);
+        ui_text(44.0f, cy, lsz, COL_WHITE, desc[i]);
+        cy += lg;
+    }
+    ui_hline(0, SCREEN_H - 3.0f, SCREEN_BOT_W, COL_LINE2);
+    ui_hline(0, SCREEN_H - 1.0f, SCREEN_BOT_W, COL_LINE1);
+
+    ui_frame_end();
 }
 
 /* Open swkbd for the current field, pre-filled with its existing value. */
@@ -122,14 +179,23 @@ static void open_keyboard_for_field(void) {
 }
 
 int main(int argc, char *argv[]) {
-    gfxInitDefault();
-    consoleInit(GFX_TOP, NULL);
+    (void)argc; (void)argv;
 
-    memset(&app_state, 0, sizeof(AppState));
-    safe_strncpy(app_state.status_message, "Scan QR code with camera", sizeof(app_state.status_message));
-    safe_strncpy(app_state.uuid, "3DS-Pronote-Device", sizeof(app_state.uuid));
-    app_state.screen = SCREEN_LOGIN;
-    app_state.needs_redraw = 1;
+    /*
+     * gfxInitDefault() brings up the LCD and GSP service — required first.
+     * C3D_Init() (inside ui_init()) then takes over the GPU command pipe
+     * on top of that. Both are needed; gfxExit() cleans up on exit.
+     * Every official citro2d/citro3d example follows this same order.
+     */
+    gfxInitDefault();
+    ui_init();
+
+    memset(&app, 0, sizeof(AppState));
+    safe_strncpy(app.status_message, "Scan QR code, then enter PIN",
+                 sizeof(app.status_message));
+    safe_strncpy(app.uuid, "3DS-Pronote-Device", sizeof(app.uuid));
+    app.screen       = SCREEN_LOGIN;
+    app.needs_redraw = 1;
 
     while (aptMainLoop()) {
         if (app_state.screen == SCREEN_QR_SCAN) {
@@ -166,14 +232,16 @@ int main(int argc, char *argv[]) {
                 } else {
                     safe_strncpy(app_state.status_message, "Invalid QR format", sizeof(app_state.status_message));
                 }
-            } else if (scan_result == QR_CANCELLED) {
-                safe_strncpy(app_state.status_message, "Scan cancelled", sizeof(app_state.status_message));
+            } else if (rc == QR_CANCELLED) {
+                safe_strncpy(app.status_message, "Scan cancelled.",
+                             sizeof(app.status_message));
             } else {
-                safe_strncpy(app_state.status_message, "QR scan failed", sizeof(app_state.status_message));
+                safe_strncpy(app.status_message, "QR scan failed.",
+                             sizeof(app.status_message));
             }
 
-            app_state.screen = SCREEN_LOGIN;
-            app_state.needs_redraw = 1;
+            app.screen       = SCREEN_LOGIN;
+            app.needs_redraw = 1;
             continue;
         }
 
@@ -184,16 +252,16 @@ int main(int argc, char *argv[]) {
         if (kdown & KEY_START) break;
 
         if (kdown & KEY_UP) {
-            app_state.current_field = (app_state.current_field - 1 + 3) % 3;
-            app_state.needs_redraw = 1;
+            app.current_field = (app.current_field - 1 + 3) % 3;
+            app.needs_redraw  = 1;
         }
         if (kdown & KEY_DOWN) {
-            app_state.current_field = (app_state.current_field + 1) % 3;
-            app_state.needs_redraw = 1;
+            app.current_field = (app.current_field + 1) % 3;
+            app.needs_redraw  = 1;
         }
         if (kdown & KEY_A) {
-            open_keyboard_for_field();
-            app_state.needs_redraw = 1;
+            open_keyboard();
+            app.needs_redraw = 1;
         }
         if (kdown & KEY_Y) {
             if      (app_state.current_field == 0) memset(app_state.username, 0, sizeof(app_state.username));
@@ -202,27 +270,32 @@ int main(int argc, char *argv[]) {
             app_state.needs_redraw = 1;
         }
         if (kdown & KEY_X) {
-            if (strlen(app_state.username) == 0)
-                safe_strncpy(app_state.status_message, "Enter username!", sizeof(app_state.status_message));
-            else if (strlen(app_state.jeton) == 0)
-                safe_strncpy(app_state.status_message, "Scan QR code first!", sizeof(app_state.status_message));
-            else if (strlen(app_state.pin) != 4)
-                safe_strncpy(app_state.status_message, "PIN must be 4 digits!", sizeof(app_state.status_message));
+            if (strlen(app.username) == 0)
+                safe_strncpy(app.status_message, "Enter username first!",
+                             sizeof(app.status_message));
+            else if (strlen(app.jeton) == 0)
+                safe_strncpy(app.status_message, "Scan QR code first!",
+                             sizeof(app.status_message));
+            else if (strlen(app.pin) != 4)
+                safe_strncpy(app.status_message, "PIN must be 4 digits!",
+                             sizeof(app.status_message));
             else {
-                safe_strncpy(app_state.status_message, "Decrypting... (coming soon)", sizeof(app_state.status_message));
-                app_state.logged_in = 1;
+                safe_strncpy(app.status_message, "Decrypting... (coming soon)",
+                             sizeof(app.status_message));
+                app.logged_in = 1;
             }
-            app_state.needs_redraw = 1;
+            app.needs_redraw = 1;
         }
 
-        if (app_state.needs_redraw) {
-            draw_login_ui();
-            app_state.needs_redraw = 0;
+        if (app.needs_redraw) {
+            draw_login_screen();
+            app.needs_redraw = 0;
         }
 
         gspWaitForVBlank();
     }
 
+    ui_exit();
     gfxExit();
     return 0;
 }
