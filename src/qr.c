@@ -1,12 +1,28 @@
 /*
  * qr.c — QR code scanner using 3DS outer camera + quirc.
  *
- * Camera display is intentionally omitted here — will be re-added
- * once the UI switches to citro2d/citro3d (see TODO: camera preview).
+ * Three hardware requirements on real 3DS:
  *
- * Event model: RESET_STICKY, re-armed after every received frame.
- * This matches the FBI-NH capturecam approach and avoids the pitfalls
- * of creating a fresh RESET_ONESHOT event on every iteration.
+ * 1. GSP conflict: citro3d holds a GSP session the camera sysmodule cannot
+ *    share. ui_suspend() tears down C3D/C2D before camInit(); ui_resume()
+ *    brings it back after camExit(). Skipping this causes a kernel panic.
+ *
+ * 2. Linear heap: the camera DMA engine can only write to physical linear
+ *    memory. calloc/malloc give standard heap which is unusable for DMA
+ *    on real hardware. cam_buf must use linearAlloc/linearFree.
+ *
+ * 3. Re-arm discipline (the hard one): CAMU_SetReceiving must NEVER be
+ *    called while the previous transfer is still in flight.
+ *    RESET_STICKY + svcClearEvent + immediate re-arm looks safe but is
+ *    not — svcClearEvent only clears the signal state; it does not wait
+ *    for the DMA to finish. Calling CAMU_SetReceiving right after causes
+ *    the sysmodule to fault on its next DMA attempt, producing a prefetch
+ *    abort / kernel panic in the camera process a few seconds in.
+ *
+ *    Fix: RESET_ONESHOT event created fresh each frame and closed after
+ *    svcWaitSynchronization. The wait atomically clears the event on
+ *    return, guaranteeing the transfer is fully complete before we touch
+ *    cam_buf or re-arm.
  */
 
 #include <3ds.h>
@@ -16,46 +32,80 @@
 #include "ui.h"
 #include "../lib/quirc/quirc.h"
 
-#define CAM_WIDTH   400
-#define CAM_HEIGHT  240
-#define CAM_BUF_SZ  (CAM_WIDTH * CAM_HEIGHT * sizeof(u16))
+#define CAM_WIDTH        400
+#define CAM_HEIGHT       240
+#define CAM_BUF_SZ       (CAM_WIDTH * CAM_HEIGHT * sizeof(u16))
+#define RECV_TIMEOUT_NS  400000000LL   // 400 ms — one frame at 30 fps + margin
 
-/* Frame-receive timeout: ~2 s at 30 fps is generous. */
-#define RECV_TIMEOUT_NS  2000000000LL
+static void draw_qr_screen(void) {
+    ui_frame_begin();
+
+    ui_clear_target(ui_get_target(GFX_TOP),    COL_BG);
+    ui_clear_target(ui_get_target(GFX_BOTTOM), COL_BG);
+
+    ui_target(GFX_TOP);
+    ui_rect(0, 0, SCREEN_TOP_W, 36.0f, C2D_Color32(0x00, 0x60, 0x52, 0xFF));
+    ui_text_centred(0, SCREEN_TOP_W, 8.0f,   0.65f, COL_WHITE,   "notApro");
+    ui_rect(0, 36.0f, SCREEN_TOP_W, 4.0f, COL_LINE1);
+    ui_rect(0, 40.0f, SCREEN_TOP_W, 2.0f, COL_LINE2);
+    ui_text_centred(0, SCREEN_TOP_W, 110.0f, 0.55f, COL_LINE2,
+                    "Point outer camera at QR code");
+    ui_text_centred(0, SCREEN_TOP_W, 132.0f, 0.50f, COL_DIMTEXT,
+                    "Screen stays dark during scan");
+    ui_text_centred(0, SCREEN_TOP_W, 152.0f, 0.50f, COL_DIMTEXT,
+                    "(camera preview coming later)");
+    ui_hline(0, SCREEN_H - 3.0f, SCREEN_TOP_W, COL_LINE2);
+    ui_hline(0, SCREEN_H - 1.0f, SCREEN_TOP_W, COL_LINE1);
+
+    ui_target(GFX_BOTTOM);
+    ui_rect(0, 0, SCREEN_BOT_W, 36.0f, C2D_Color32(0x00, 0x60, 0x52, 0xFF));
+    ui_text_centred(0, SCREEN_BOT_W, 8.0f, 0.65f, COL_WHITE, "QR Scanner");
+    ui_hline(0, 36.0f, SCREEN_BOT_W, COL_LINE1);
+    float cy = 52.0f;
+    ui_text_centred(0, SCREEN_BOT_W, cy,   0.50f, COL_WHITE,  "Scanning for QR code...");
+    cy += 30.0f;
+    ui_text(16.0f, cy, 0.50f, COL_LINE1, "B");
+    ui_text(36.0f, cy, 0.50f, COL_WHITE, "Cancel");
+    cy += 28.0f;
+    ui_text_centred(0, SCREEN_BOT_W, cy, 0.42f, COL_DIMTEXT,
+                    "Auto-detected when in frame");
+    ui_hline(0, SCREEN_H - 3.0f, SCREEN_BOT_W, COL_LINE2);
+    ui_hline(0, SCREEN_H - 1.0f, SCREEN_BOT_W, COL_LINE1);
+
+    ui_frame_end();
+}
 
 int qr_scan(char *out_buf, size_t out_len) {
-    /* --- quirc init -------------------------------------------------- */
+    /* 1. Draw UI while citro3d is still alive */
+    draw_qr_screen();
+
+    /* 2. Release GSP before camera init */
+    ui_suspend();
+
+    /* 3. quirc */
     struct quirc *qrc = quirc_new();
-    if (!qrc) return QR_ERROR;
+    if (!qrc) { ui_resume(); return QR_ERROR; }
     if (quirc_resize(qrc, CAM_WIDTH, CAM_HEIGHT) < 0) {
         quirc_destroy(qrc);
+        ui_resume();
         return QR_ERROR;
     }
 
-    /* --- frame buffer ------------------------------------------------- */
-    u16 *cam_buf = (u16 *)calloc(1, CAM_BUF_SZ);
+    /* 4. Linear heap — required for DMA on real hardware */
+    u16 *cam_buf = (u16 *)linearAlloc(CAM_BUF_SZ);
     if (!cam_buf) {
         quirc_destroy(qrc);
+        ui_resume();
         return QR_ERROR;
     }
+    memset(cam_buf, 0, CAM_BUF_SZ);
 
-    /* --- UI: instructions on bottom screen ---------------------------- */
-    consoleInit(GFX_BOTTOM, NULL);
-    consoleClear();
-    printf("\x1b[2;0H");
-    printf("=== QR CODE SCANNER ===\n\n");
-    printf("Point the outer camera at\n");
-    printf("your Pronote QR code.\n\n");
-    printf("B: Cancel\n");
-    gfxFlushBuffers();
-    gfxSwapBuffers();
-
-    /* --- camera init -------------------------------------------------- */
+    /* 5. Camera init */
     Result res = camInit();
     if (R_FAILED(res)) {
-        free(cam_buf);
+        linearFree(cam_buf);
         quirc_destroy(qrc);
-        consoleInit(GFX_TOP, NULL);
+        ui_resume();
         return QR_ERROR;
     }
 
@@ -72,43 +122,29 @@ int qr_scan(char *out_buf, size_t out_len) {
     CAMU_SetTrimming(PORT_CAM1, false);
     CAMU_SetTransferBytes(PORT_CAM1, transferUnit, CAM_WIDTH, CAM_HEIGHT);
 
-    /* RESET_STICKY: signal stays set until we clear it, so we never miss
-       a frame between CAMU_SetReceiving and svcWaitSynchronization. */
-    Handle recv_event = 0;
-    svcCreateEvent(&recv_event, RESET_STICKY);
-
     CAMU_ClearBuffer(PORT_CAM1);
-    CAMU_SetReceiving(&recv_event, cam_buf, PORT_CAM1, CAM_BUF_SZ, (s16)transferUnit);
     CAMU_StartCapture(PORT_CAM1);
 
-    /* 6. Capture loop
-     *
-     * Key discipline: create a fresh RESET_ONESHOT event every iteration.
-     * svcWaitSynchronization on a RESET_ONESHOT atomically clears it when it
-     * returns, so the transfer is guaranteed complete before we touch cam_buf
-     * or call CAMU_SetReceiving again. No svcClearEvent needed.
-     *
-     * We also flush the CPU cache before arming so the DMA engine sees a clean
-     * buffer, then invalidate after the wait so the CPU sees fresh pixel data.
-     */
+    /* 6. Capture loop — RESET_ONESHOT, fresh event every frame */
     int result = QR_CANCELLED;
 
     while (aptMainLoop()) {
         hidScanInput();
         if (hidKeysDown() & KEY_B) break;
 
-        /* Wait for next frame (or timeout) */
-        res = svcWaitSynchronization(recv_event, RECV_TIMEOUT_NS);
-        if (R_FAILED(res)) continue; /* timeout — try again */
-        svcClearEvent(recv_event);   /* re-arm for the next frame */
+        GSPGPU_FlushDataCache(cam_buf, CAM_BUF_SZ);
 
-        /* Flush cache so quirc reads the DMA'd data */
-        GSPGPU_InvalidateDataCache(cam_buf, CAM_BUF_SZ);
-
-        /* Re-arm camera for next frame immediately */
+        Handle recv_event = 0;
+        svcCreateEvent(&recv_event, RESET_ONESHOT);
         CAMU_SetReceiving(&recv_event, cam_buf, PORT_CAM1, CAM_BUF_SZ, (s16)transferUnit);
 
-        /* Convert RGB565 frame to greyscale for quirc */
+        res = svcWaitSynchronization(recv_event, RECV_TIMEOUT_NS);
+        svcCloseHandle(recv_event);
+
+        if (R_FAILED(res)) continue;
+
+        GSPGPU_InvalidateDataCache(cam_buf, CAM_BUF_SZ);
+
         int w = 0, h = 0;
         uint8_t *img = quirc_begin(qrc, &w, &h);
         for (int y = 0; y < h; y++) {
@@ -141,12 +177,10 @@ int qr_scan(char *out_buf, size_t out_len) {
 done:
     CAMU_StopCapture(PORT_CAM1);
     CAMU_Activate(SELECT_NONE);
-    svcCloseHandle(recv_event);
-    free(cam_buf);
+    linearFree(cam_buf);
     camExit();
     quirc_destroy(qrc);
 
-    /* Restore top screen for login UI */
-    consoleInit(GFX_TOP, NULL);
+    ui_resume();
     return result;
 }
