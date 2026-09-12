@@ -30,14 +30,14 @@
 #include <string.h>
 #include "qr.h"
 #include "ui.h"
+#include "log.h"
 #include "../lib/quirc/quirc.h"
 
 #define CAM_WIDTH        400
 #define CAM_HEIGHT       240
 #define CAM_BUF_SZ       (CAM_WIDTH * CAM_HEIGHT * sizeof(u16))
-#define RECV_TIMEOUT_NS  400000000LL   // 400 ms — one frame at 30 fps + margin
+#define RECV_TIMEOUT_NS  400000000LL
 
-/* "Hold B" at size 0.50f is ~56 px wide; add 8 px gap → desc at 80.0f */
 #define QR_BTN_X   16.0f
 #define QR_DESC_X  65.0f
 
@@ -80,38 +80,42 @@ static void draw_qr_screen(void) {
 }
 
 int qr_scan(char *out_buf, size_t out_len) {
-    /* 1. Draw UI while citro3d is still alive */
     draw_qr_screen();
 
-    /* 2. Release GSP before camera init */
+    LOG("qr_scan: suspending citro3d");
     ui_suspend();
 
-    /* 3. quirc */
     struct quirc *qrc = quirc_new();
-    if (!qrc) { ui_resume(); return QR_ERROR; }
+    if (!qrc) {
+        LOG("qr_scan: quirc_new failed");
+        ui_resume();
+        return QR_ERROR;
+    }
     if (quirc_resize(qrc, CAM_WIDTH, CAM_HEIGHT) < 0) {
+        LOG("qr_scan: quirc_resize failed");
         quirc_destroy(qrc);
         ui_resume();
         return QR_ERROR;
     }
 
-    /* 4. Linear heap — required for DMA on real hardware */
     u16 *cam_buf = (u16 *)linearAlloc(CAM_BUF_SZ);
     if (!cam_buf) {
+        LOG("qr_scan: linearAlloc failed");
         quirc_destroy(qrc);
         ui_resume();
         return QR_ERROR;
     }
     memset(cam_buf, 0, CAM_BUF_SZ);
 
-    /* 5. Camera init */
     Result res = camInit();
     if (R_FAILED(res)) {
+        LOG("qr_scan: camInit failed (0x%08lX)", res);
         linearFree(cam_buf);
         quirc_destroy(qrc);
         ui_resume();
         return QR_ERROR;
     }
+    LOG("qr_scan: camera initialised");
 
     CAMU_SetSize(SELECT_OUT1, SIZE_CTR_TOP_LCD, CONTEXT_A);
     CAMU_SetOutputFormat(SELECT_OUT1, OUTPUT_RGB_565, CONTEXT_A);
@@ -123,18 +127,23 @@ int qr_scan(char *out_buf, size_t out_len) {
 
     u32 transferUnit = 0;
     CAMU_GetMaxBytes(&transferUnit, CAM_WIDTH, CAM_HEIGHT);
+    LOG("qr_scan: transferUnit=%lu", transferUnit);
     CAMU_SetTrimming(PORT_CAM1, false);
     CAMU_SetTransferBytes(PORT_CAM1, transferUnit, CAM_WIDTH, CAM_HEIGHT);
 
     CAMU_ClearBuffer(PORT_CAM1);
     CAMU_StartCapture(PORT_CAM1);
+    LOG("qr_scan: capture started");
 
-    /* 6. Capture loop — RESET_ONESHOT, fresh event every frame */
-    int result = QR_CANCELLED;
+    int result  = QR_CANCELLED;
+    int frames  = 0;
 
     while (aptMainLoop()) {
         hidScanInput();
-        if (hidKeysHeld() & KEY_B) break;
+        if (hidKeysHeld() & KEY_B) {
+            LOG("qr_scan: cancelled by user after %d frames", frames);
+            break;
+        }
 
         GSPGPU_FlushDataCache(cam_buf, CAM_BUF_SZ);
 
@@ -145,9 +154,13 @@ int qr_scan(char *out_buf, size_t out_len) {
         res = svcWaitSynchronization(recv_event, RECV_TIMEOUT_NS);
         svcCloseHandle(recv_event);
 
-        if (R_FAILED(res)) continue;
+        if (R_FAILED(res)) {
+            LOG("qr_scan: frame %d wait timeout (0x%08lX)", frames, res);
+            continue;
+        }
 
         GSPGPU_InvalidateDataCache(cam_buf, CAM_BUF_SZ);
+        frames++;
 
         int w = 0, h = 0;
         uint8_t *img = quirc_begin(qrc, &w, &h);
@@ -163,11 +176,15 @@ int qr_scan(char *out_buf, size_t out_len) {
         quirc_end(qrc);
 
         int n = quirc_count(qrc);
+        if (n > 0) LOG("qr_scan: frame %d — %d code(s) detected", frames, n);
+
         for (int i = 0; i < n; i++) {
             struct quirc_code code;
             struct quirc_data data;
             quirc_extract(qrc, i, &code);
             if (quirc_decode(&code, &data) == QUIRC_SUCCESS) {
+                LOG("qr_scan: decoded on frame %d, payload_len=%d",
+                    frames, data.payload_len);
                 size_t len = data.payload_len;
                 if (len >= out_len) len = out_len - 1;
                 memcpy(out_buf, data.payload, len);
@@ -179,12 +196,14 @@ int qr_scan(char *out_buf, size_t out_len) {
     }
 
 done:
+    LOG("qr_scan: stopping capture (result=%d, frames=%d)", result, frames);
     CAMU_StopCapture(PORT_CAM1);
     CAMU_Activate(SELECT_NONE);
     linearFree(cam_buf);
     camExit();
     quirc_destroy(qrc);
 
+    LOG("qr_scan: resuming citro3d");
     ui_resume();
     return result;
 }
