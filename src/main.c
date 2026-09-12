@@ -182,10 +182,12 @@ int main(int argc, char *argv[]) {
     (void)argc; (void)argv;
 
     /*
-     * Do NOT call gfxInitDefault() / gfxExit().
-     * C3D_Init() inside ui_init() owns GSP/GPU entirely.
-     * Double-init corrupts framebuffer state and causes black screen.
+     * gfxInitDefault() brings up the LCD and GSP service — required first.
+     * C3D_Init() (inside ui_init()) then takes over the GPU command pipe
+     * on top of that. Both are needed; gfxExit() cleans up on exit.
+     * Every official citro2d/citro3d example follows this same order.
      */
+    gfxInitDefault();
     ui_init();
 
     memset(&app, 0, sizeof(AppState));
@@ -291,5 +293,6 @@ int main(int argc, char *argv[]) {
     }
 
     ui_exit();
+    gfxExit();
     return 0;
 }
