@@ -2,8 +2,8 @@
  * ui.c — citro2d UI layer for notApro
  *
  * Design notes:
- *   - C2D_FontLoadSystem() is called once and cached; calling it per
- *     draw would reload the font handle on every frame.
+ *   - C2D_FontLoadSystem(CFG_REGION_EUR) is called once and cached.
+ *     EUR covers the full Latin charset and works on all 3DS regions.
  *   - The text buffer is cleared at the start of every frame (ui_frame_begin)
  *     so it never grows unboundedly across frames.
  *   - s_cur tracks the currently active render target so callers don't
@@ -39,8 +39,8 @@ void ui_init(void) {
     /* 1024 glyphs is plenty for all strings in a single login frame */
     s_tbuf = C2D_TextBufNew(1024);
 
-    /* Load the 3DS system font once — cheap to keep alive */
-    s_font = C2D_FontLoadSystem();
+    /* CFG_REGION_EUR: full Latin charset, works on all console regions */
+    s_font = C2D_FontLoadSystem(CFG_REGION_EUR);
 }
 
 void ui_exit(void) {
