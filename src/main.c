@@ -195,8 +195,15 @@ static void open_keyboard(void) {
  * ---------------------------------------------------------------------- */
 int main(int argc, char *argv[]) {
     (void)argc; (void)argv;
-    gfxInitDefault();
-    ui_init();   /* citro2d stays alive for the entire lifetime of the app */
+
+    /*
+     * Do NOT call gfxInitDefault() here.
+     * ui_init() calls C3D_Init() which initialises GSP/GPU ownership
+     * and allocates its own framebuffers via citro3d. Calling gfxInitDefault()
+     * first would double-init GSP and corrupt framebuffer state. Similarly,
+     * gfxExit() must not be called on exit — ui_exit() handles teardown.
+     */
+    ui_init();
 
     memset(&app, 0, sizeof(AppState));
     safe_strncpy(app.status_message, "Scan QR code, then enter PIN",
@@ -306,6 +313,5 @@ int main(int argc, char *argv[]) {
     }
 
     ui_exit();
-    gfxExit();
     return 0;
 }
