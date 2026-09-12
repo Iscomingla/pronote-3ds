@@ -40,7 +40,14 @@ void ui_frame_end(void);
 // Switch active render target.  screen = GFX_TOP or GFX_BOTTOM.
 void ui_target(gfxScreen_t screen);
 
-// Fill the whole current target with a solid colour.
+// Get the underlying C3D_RenderTarget for a screen (for ui_clear_target).
+C3D_RenderTarget *ui_get_target(gfxScreen_t screen);
+
+// Clear a specific render target (call BEFORE ui_target for that screen,
+// because C2D_TargetClear must come before C2D_SceneBegin).
+void ui_clear_target(C3D_RenderTarget *t, u32 colour);
+
+// Fill the whole current target with a solid colour (legacy, prefer ui_clear_target).
 void ui_clear(u32 colour);
 
 // Filled rectangle.
