@@ -16,15 +16,15 @@
  *   Session 3: Version v13/v14/v15 jumps -> unsharp added.
  *   Session 4: shared_buf calloc -> stale CPU cache -> torn frames. Fixed
  *              with linearAlloc + __dsb() + InvalidateDataCache.
- *   Session 5: DATA_ECC persists. Unsharp creates module-edge halos -> bits
- *              flip. Dropped unsharp, added 1x full-res path.
- *   Session 6: Version rock-solid at v13. Still DATA_ECC every frame.
- *              Suspected: Pronote uses high ECC level (H) or a mask pattern
- *              that is hard to threshold, OR FORMAT_ECC is silently recovering
- *              to the wrong mask pattern -> all data modules wrong.
- *              Added diagnostic logging: ecc_level, mask, eci, data_type
- *              from quirc_code / quirc_data so we can see what the format
- *              strip is actually reporting.
+ *   Session 5: DATA_ECC persists. Unsharp creates module-edge halos.
+ *              Dropped unsharp, added 1x full-res path.
+ *   Session 6: Version rock-solid v13. DATA_ECC every frame.
+ *              ecc_level/mask not in quirc_code (public API), only in
+ *              quirc_data which is unpopulated on decode failure.
+ *              Next diagnostic: log quirc_code.corners to check whether
+ *              perspective correction is stable. Unstable corners ->
+ *              module sampling hits between cells -> DATA_ECC even with
+ *              clean image.
  *
  * Static buffer layout:
  *   s_frame_buf  -- 192000 B  u16[400*240]
@@ -65,7 +65,7 @@ typedef struct {
 } cam_ctx_t;
 
 // ---------------------------------------------------------------------------
-// Camera thread (unchanged from previous session)
+// Camera thread
 // ---------------------------------------------------------------------------
 static void cam_thread_fn(void *arg) {
     cam_ctx_t *ctx = (cam_ctx_t *)arg;
@@ -174,7 +174,12 @@ static inline u8 rgb565_luma(u16 px) {
 }
 
 // ---------------------------------------------------------------------------
-// try_decode -- with diagnostic logging of format strip fields
+// try_decode
+// Logs corners of the detected code so we can check perspective stability.
+// ecc_level and mask are only in quirc_data (populated on success only),
+// not in quirc_code, so we can't read them on failure. Instead we log the
+// four corner pixel positions — if these jump between frames the perspective
+// transform is unstable and module sampling will be off.
 // ---------------------------------------------------------------------------
 static bool try_decode(struct quirc *qrc, const u8 *buf, int w, int h,
                        int frame, int scale) {
@@ -191,37 +196,36 @@ static bool try_decode(struct quirc *qrc, const u8 *buf, int w, int h,
     for (int i = 0; i < n; i++) {
         quirc_extract(qrc, i, &s_qr_code);
 
-        /* Log format strip fields from quirc_code:
-         *   ecc_level: 0=M 1=L 2=H 3=Q
-         *   mask:      0-7 (XOR mask pattern applied to data modules)
-         * These come from the format information strips and are decoded
-         * before ECC. If ecc_level or mask jump around between frames,
-         * the format strip is being misread (image quality / contrast). */
-        LOG("qr_scan: frame %d scale %dx code %d size=%d (v%d) ecc=%d mask=%d",
+        /* corners[0]=TL, [1]=TR, [2]=BR, [3]=BL (clockwise from top-left) */
+        LOG("qr_scan: frame %d scale %dx code %d size=%d (v%d) "
+            "TL(%d,%d) TR(%d,%d) BR(%d,%d) BL(%d,%d)",
             frame, scale, i,
             s_qr_code.size, (s_qr_code.size - 17) / 4,
-            (int)s_qr_code.ecc_level, (int)s_qr_code.mask);
+            s_qr_code.corners[0].x, s_qr_code.corners[0].y,
+            s_qr_code.corners[1].x, s_qr_code.corners[1].y,
+            s_qr_code.corners[2].x, s_qr_code.corners[2].y,
+            s_qr_code.corners[3].x, s_qr_code.corners[3].y);
 
         quirc_decode_error_t err = quirc_decode(&s_qr_code, &s_qr_data);
         if (err == QUIRC_SUCCESS) {
-            LOG("qr_scan: decoded frame %d scale %dx: version=%d ecc=%d dtype=%d eci=%lu len=%d",
+            LOG("qr_scan: SUCCESS frame %d scale %dx v%d ecc=%d mask=%d dtype=%d len=%d",
                 frame, scale,
-                (int)s_qr_data.version,
-                (int)s_qr_data.ecc_level,
-                (int)s_qr_data.data_type,
-                (unsigned long)s_qr_data.eci,
-                (int)s_qr_data.payload_len);
+                s_qr_data.version, s_qr_data.ecc_level, s_qr_data.mask,
+                s_qr_data.data_type, s_qr_data.payload_len);
             return true;
         }
-        LOG("qr_scan: normal decode err %d (scale %dx)", (int)err, scale);
+        LOG("qr_scan: normal err '%s' (scale %dx)", quirc_strerror(err), scale);
 
         quirc_flip(&s_qr_code);
         err = quirc_decode(&s_qr_code, &s_qr_data);
         if (err == QUIRC_SUCCESS) {
-            LOG("qr_scan: decoded (flipped) frame %d scale %dx", frame, scale);
+            LOG("qr_scan: SUCCESS (flipped) frame %d scale %dx v%d ecc=%d mask=%d len=%d",
+                frame, scale,
+                s_qr_data.version, s_qr_data.ecc_level, s_qr_data.mask,
+                s_qr_data.payload_len);
             return true;
         }
-        LOG("qr_scan: flipped decode err %d (scale %dx)", (int)err, scale);
+        LOG("qr_scan: flipped err '%s' (scale %dx)", quirc_strerror(err), scale);
     }
     return false;
 }
