@@ -64,8 +64,8 @@ static void draw_qr_screen(void) {
     float cy = 52.0f;
     ui_text_centred(0, SCREEN_BOT_W, cy,   0.50f, COL_WHITE,  "Scanning for QR code...");
     cy += 30.0f;
-    ui_text(16.0f, cy, 0.50f, COL_LINE1, "B");
-    ui_text(36.0f, cy, 0.50f, COL_WHITE, "Cancel");
+    ui_text(16.0f, cy, 0.50f, COL_LINE1, "Hold B");
+    ui_text(72.0f, cy, 0.50f, COL_WHITE, "to cancel");
     cy += 28.0f;
     ui_text_centred(0, SCREEN_BOT_W, cy, 0.42f, COL_DIMTEXT,
                     "Auto-detected when in frame");
@@ -130,7 +130,7 @@ int qr_scan(char *out_buf, size_t out_len) {
 
     while (aptMainLoop()) {
         hidScanInput();
-        if (hidKeysDown() & KEY_B) break;
+        if (hidKeysHeld() & KEY_B) break;
 
         GSPGPU_FlushDataCache(cam_buf, CAM_BUF_SZ);
 
