@@ -140,9 +140,9 @@ static void draw_login_screen(void) {
     float cy  = HEADER_H + 10.0f;
     float lsz = 0.50f;
     float lg  = 18.0f;
-    const char *keys[] = { "\xe2\x86\x91\xe2\x86\x93", "A", "Y", "X", "START" };
+    const char *keys[]  = { "\xe2\x86\x91\xe2\x86\x93", "A", "Y", "X", "START" };
     const char *descs[] = { "Navigate fields", "Edit / Scan QR",
-                            "Clear field", "Login", "Exit" };
+                            "Clear field", "Login", "Exit app" };
     for (int i = 0; i < 5; i++) {
         ui_text(12.0f, cy, lsz, COL_LINE1, keys[i]);
         ui_text(44.0f, cy, lsz, COL_WHITE, descs[i]);
