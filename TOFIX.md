@@ -1,10 +1,9 @@
 # TOFIX
 
-- [ ] QR decode still failing after multi-scale + adaptive threshold attempt:
-      - 4x/3x scales never detect codes (too small for finder pattern detection)
-      - Adaptive threshold causes FORMAT_ECC (error 3) by corrupting format strips
-      - Mutex held during processing causes camera DMA buffer errors
-      Fix:
-        1. Copy frame under mutex, release before processing
-        2. Drop adaptive threshold — use raw greyscale, let quirc Otsu run
-        3. Keep only 2x scale (only one that detects); add 1x (full 400x240) as fallback
+- [ ] QR decode still failing (DATA_ECC) after mutex + scale fixes:
+      Buffer errors gone. Version now stable at v13/v14 but flips between them,
+      meaning quirc's grid alignment is off (perspective correction error).
+      Finder pattern corners not detected precisely enough -> module sampling
+      lands between cells -> bit errors exhaust ECC capacity.
+      Fix: apply 3x3 unsharp mask to greyscale image before quirc to sharpen
+      finder pattern edges, improving corner detection accuracy.
