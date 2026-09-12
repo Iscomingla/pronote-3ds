@@ -6,9 +6,13 @@
 #include "network.h"
 #include "qr.h"
 
-#define MAX_USERNAME_LEN 64
-#define MAX_JETON_LEN    256
-#define MAX_PIN          5   // 4 digits + null
+/*
+ * The jeton is a hex-encoded AES-CBC ciphertext.
+ * No documented protocol upper bound; 512 chars is safe headroom.
+ */
+#define MAX_USERNAME_LEN  64
+#define MAX_JETON_LEN    513   /* 512 usable chars + null */
+#define MAX_PIN            5   /* 4 digits + null */
 
 typedef enum {
     SCREEN_LOGIN,
@@ -20,7 +24,7 @@ typedef struct {
     char   jeton[MAX_JETON_LEN];
     char   pin[MAX_PIN];
     char   uuid[37];
-    int    current_field;   // 0: username  1: QR/jeton  2: pin
+    int    current_field;   /* 0: username  1: QR/jeton  2: pin */
     int    logged_in;
     char   status_message[128];
     int    needs_redraw;
@@ -29,10 +33,10 @@ typedef struct {
 
 static AppState app;
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-void safe_strncpy(char *dest, const char *src, size_t maxlen) {
+/* -------------------------------------------------------------------------
+ * Helpers
+ * ---------------------------------------------------------------------- */
+static void safe_strncpy(char *dest, const char *src, size_t maxlen) {
     if (!dest || !src || maxlen == 0) return;
     size_t len = strlen(src);
     if (len >= maxlen) len = maxlen - 1;
@@ -40,113 +44,100 @@ void safe_strncpy(char *dest, const char *src, size_t maxlen) {
     dest[len] = '\0';
 }
 
-// ---------------------------------------------------------------------------
-// Login screen layout constants
-// ---------------------------------------------------------------------------
-#define HEADER_H        36.0f
-#define STRIPE1_Y       (HEADER_H)
-#define STRIPE1_H        4.0f
-#define STRIPE2_Y       (STRIPE1_Y + STRIPE1_H)
-#define STRIPE2_H        2.0f
-#define CONTENT_Y       (STRIPE2_Y + STRIPE2_H + 12.0f)
+/* -------------------------------------------------------------------------
+ * Login screen layout
+ * ---------------------------------------------------------------------- */
+#define HEADER_H   36.0f
+#define STRIPE1_Y  (HEADER_H)
+#define STRIPE1_H   4.0f
+#define STRIPE2_Y  (STRIPE1_Y + STRIPE1_H)
+#define STRIPE2_H   2.0f
+#define CONTENT_Y  (STRIPE2_Y + STRIPE2_H + 12.0f)
 
-#define FIELD_H         34.0f
-#define FIELD_GAP        8.0f
-#define FIELD_X         16.0f
-#define FIELD_W         (SCREEN_TOP_W - FIELD_X * 2.0f)
-#define FIELD_RADIUS     4.0f   // visual only — C2D has no rounded rect, faked with overlap
+#define FIELD_H    34.0f
+#define FIELD_GAP   8.0f
+#define FIELD_X    16.0f
+#define FIELD_W    (SCREEN_TOP_W - FIELD_X * 2.0f)
 
-// Status bar at the bottom
-#define STATUS_H        18.0f
-#define STATUS_Y        (SCREEN_H - STATUS_H)
+#define STATUS_H   18.0f
+#define STATUS_Y   (SCREEN_H - STATUS_H)
 
-// ---------------------------------------------------------------------------
-// draw_login_screen  — called every frame that needs_redraw is set
-// ---------------------------------------------------------------------------
-static void draw_field(float y, int index, const char *label,
-                        const char *value, int is_masked, int selected) {
-    u32 bg    = selected ? COL_SELECTED : C2D_Color32(0x00, 0x00, 0x00, 0x28);
-    u32 bord  = selected ? COL_LINE1    : COL_LINE2;
+static void draw_field(float y, const char *label,
+                       const char *value, int is_masked, int selected) {
+    u32 bg   = selected ? COL_SELECTED : C2D_Color32(0x00, 0x00, 0x00, 0x28);
+    u32 bord = selected ? COL_LINE1    : COL_LINE2;
 
-    // Field background
     ui_rect(FIELD_X, y, FIELD_W, FIELD_H, bg);
-    // Bottom border line
     ui_hline(FIELD_X, y + FIELD_H - 1.0f, FIELD_W, bord);
 
-    // Label (small, dimmed)
+    /* Small label above the value */
     ui_text(FIELD_X + 8.0f, y + 4.0f, 0.45f, COL_DIMTEXT, label);
 
-    // Value (or placeholder)
+    /* Value (masked, truncated, or placeholder) */
     char display[128] = {0};
     if (is_masked && strlen(value) > 0) {
-        for (int i = 0; i < (int)strlen(value) && i < 4; i++) display[i] = '*';
+        for (int i = 0; i < (int)strlen(value) && i < 4; i++)
+            display[i] = '*';
     } else if (strlen(value) == 0) {
-        safe_strncpy(display, "—", sizeof(display));
+        safe_strncpy(display, "\xe2\x80\x94", sizeof(display)); /* em-dash */
+    } else if (strlen(value) > 24) {
+        memcpy(display, value, 21);
+        strcat(display, "...");
     } else {
-        // Truncate long values with ellipsis
-        if (strlen(value) > 24) {
-            memcpy(display, value, 21);
-            strcat(display, "...");
-        } else {
-            safe_strncpy(display, value, sizeof(display));
-        }
+        safe_strncpy(display, value, sizeof(display));
     }
+
     u32 val_col = strlen(value) == 0 ? COL_DIMTEXT : COL_WHITE;
     ui_text(FIELD_X + 8.0f, y + 16.0f, 0.55f, val_col, display);
 
-    // Selected indicator: small triangle / arrow on the left edge
-    if (selected) {
+    /* Selection bar on the left edge */
+    if (selected)
         ui_rect(FIELD_X, y + FIELD_H * 0.25f, 3.0f, FIELD_H * 0.5f, COL_LINE1);
-    }
 }
 
 static void draw_login_screen(void) {
     ui_frame_begin();
 
-    // ----- TOP SCREEN -----
+    /* ---- TOP SCREEN ---- */
     ui_target(GFX_TOP);
     ui_clear(COL_BG);
 
-    // Header bar
+    /* Header */
     ui_rect(0, 0, SCREEN_TOP_W, HEADER_H, C2D_Color32(0x00, 0x60, 0x52, 0xFF));
     ui_text_centred(0, SCREEN_TOP_W, 8.0f, 0.65f, COL_WHITE, "notApro");
 
-    // Decorative stripes
-    ui_hline(0, STRIPE1_Y, SCREEN_TOP_W, COL_LINE1);
-    ui_rect(0, STRIPE1_Y + 1.0f, SCREEN_TOP_W, STRIPE1_H - 1.0f, COL_LINE1);
-    ui_hline(0, STRIPE2_Y, SCREEN_TOP_W, COL_LINE2);
-    ui_rect(0, STRIPE2_Y + 1.0f, SCREEN_TOP_W, STRIPE2_H - 1.0f, COL_LINE2);
+    /* Double stripe */
+    ui_rect(0, STRIPE1_Y, SCREEN_TOP_W, STRIPE1_H, COL_LINE1);
+    ui_rect(0, STRIPE2_Y, SCREEN_TOP_W, STRIPE2_H, COL_LINE2);
 
-    // Fields
+    /* Fields */
     float fy = CONTENT_Y;
 
-    // Username
-    char user_label[64];
-    snprintf(user_label, sizeof(user_label), "Username%s",
+    char lbl[80];
+    snprintf(lbl, sizeof(lbl), "Username%s",
              app.current_field == 0 ? "  [A: edit]" : "");
-    draw_field(fy, 0, user_label, app.username, 0, app.current_field == 0);
+    draw_field(fy, lbl, app.username, 0, app.current_field == 0);
     fy += FIELD_H + FIELD_GAP;
 
-    // QR / Jeton
-    const char *jeton_hint = app.current_field == 1 ? "  [A: scan QR]" : "";
-    char qr_label[64];
-    snprintf(qr_label, sizeof(qr_label), "Pronote QR%s", jeton_hint);
-    const char *qr_val = strlen(app.jeton) > 0 ? "Scanned \xe2\x9c\x93" : "Not scanned";
-    draw_field(fy, 1, qr_label, qr_val, 0, app.current_field == 1);
+    snprintf(lbl, sizeof(lbl), "Pronote QR%s",
+             app.current_field == 1 ? "  [A: scan]" : "");
+    const char *qr_val = strlen(app.jeton) > 0
+                         ? "Scanned \xe2\x9c\x93"  /* ✓ */
+                         : "Not scanned";
+    draw_field(fy, lbl, qr_val, 0, app.current_field == 1);
     fy += FIELD_H + FIELD_GAP;
 
-    // PIN
-    char pin_label[64];
-    snprintf(pin_label, sizeof(pin_label), "PIN code (4 digits)%s",
+    snprintf(lbl, sizeof(lbl), "PIN code (4 digits)%s",
              app.current_field == 2 ? "  [A: enter]" : "");
-    draw_field(fy, 2, pin_label, app.pin, 1, app.current_field == 2);
+    draw_field(fy, lbl, app.pin, 1, app.current_field == 2);
 
-    // Status bar
-    ui_rect(0, STATUS_Y, SCREEN_TOP_W, STATUS_H, C2D_Color32(0x00, 0x50, 0x40, 0xCC));
+    /* Status bar */
+    ui_rect(0, STATUS_Y, SCREEN_TOP_W, STATUS_H,
+            C2D_Color32(0x00, 0x50, 0x40, 0xCC));
     ui_hline(0, STATUS_Y, SCREEN_TOP_W, COL_LINE2);
     ui_text(8.0f, STATUS_Y + 2.0f, 0.45f, COL_WHITE, app.status_message);
 
-    // ----- BOTTOM SCREEN — controls -----
+    /* ---- BOTTOM SCREEN — controls ---- */
     ui_target(GFX_BOTTOM);
     ui_clear(COL_BG);
 
@@ -154,30 +145,34 @@ static void draw_login_screen(void) {
     ui_text_centred(0, SCREEN_BOT_W, 8.0f, 0.65f, COL_WHITE, "Controls");
     ui_hline(0, HEADER_H, SCREEN_BOT_W, COL_LINE1);
 
-    float cy = HEADER_H + 10.0f;
-    float ls = 0.50f;
-    float lg = 18.0f;
-    ui_text(12.0f, cy, ls, COL_LINE1,  "\xe2\x86\x91\xe2\x86\x93"); cy += lg;  // ↑↓
-    ui_text(44.0f, cy - lg, ls, COL_WHITE, "Navigate fields");
-    ui_text(12.0f, cy, ls, COL_LINE1,  "A");  cy += lg;
-    ui_text(44.0f, cy - lg, ls, COL_WHITE, "Edit / Scan QR");
-    ui_text(12.0f, cy, ls, COL_LINE1,  "Y");  cy += lg;
-    ui_text(44.0f, cy - lg, ls, COL_WHITE, "Clear field");
-    ui_text(12.0f, cy, ls, COL_LINE1,  "X");  cy += lg;
-    ui_text(44.0f, cy - lg, ls, COL_WHITE, "Login");
-    ui_text(12.0f, cy, ls, COL_LINE1,  "START"); cy += lg;
-    ui_text(44.0f, cy - lg, ls, COL_WHITE, "Exit");
+    float cy  = HEADER_H + 10.0f;
+    float lsz = 0.50f;
+    float lg  = 18.0f;
+    /* Key column at x=12, description at x=44 */
+    const char *keys[] = { "\xe2\x86\x91\xe2\x86\x93", "A", "Y", "X", "START" };
+    const char *desc[] = {
+        "Navigate fields",
+        "Edit / Scan QR",
+        "Clear field",
+        "Login",
+        "Exit",
+    };
+    for (int i = 0; i < 5; i++) {
+        ui_text(12.0f, cy, lsz, COL_LINE1,  keys[i]);
+        ui_text(44.0f, cy, lsz, COL_WHITE,  desc[i]);
+        cy += lg;
+    }
 
-    // Bottom stripe
+    /* Bottom accent lines */
     ui_hline(0, SCREEN_H - 3.0f, SCREEN_BOT_W, COL_LINE2);
     ui_hline(0, SCREEN_H - 1.0f, SCREEN_BOT_W, COL_LINE1);
 
     ui_frame_end();
 }
 
-// ---------------------------------------------------------------------------
-// Keyboard helpers
-// ---------------------------------------------------------------------------
+/* -------------------------------------------------------------------------
+ * Keyboard / field edit
+ * ---------------------------------------------------------------------- */
 static void open_keyboard(void) {
     if (app.current_field == 1) {
         app.screen = SCREEN_QR_SCAN;
@@ -188,16 +183,22 @@ static void open_keyboard(void) {
     char tmp[512] = {0};
 
     if (app.current_field == 0) {
-        swkbdInit(&swkbd, SWKBD_TYPE_NORMAL, 2, 64);
+        swkbdInit(&swkbd, SWKBD_TYPE_NORMAL, 2, MAX_USERNAME_LEN - 1);
         swkbdSetHintText(&swkbd, "Enter username from QR code");
         safe_strncpy(tmp, app.username, sizeof(tmp));
     } else {
         swkbdInit(&swkbd, SWKBD_TYPE_NUMPAD, 1, 4);
         swkbdSetPasswordMode(&swkbd, SWKBD_PASSWORD_HIDE_DELAY);
+        swkbdSetValidation(&swkbd, SWKBD_ANYTHING, 0, 0);
+        swkbdSetFeatures(&swkbd, SWKBD_FIXED_WIDTH);
         swkbdSetHintText(&swkbd, "Enter 4-digit PIN");
         safe_strncpy(tmp, app.pin, sizeof(tmp));
     }
 
+    if (tmp[0] != '\0')
+        swkbdSetInitialText(&swkbd, tmp);
+
+    memset(tmp, 0, sizeof(tmp));
     if (swkbdInputText(&swkbd, tmp, sizeof(tmp)) == SWKBD_BUTTON_CONFIRM) {
         if (app.current_field == 0)
             safe_strncpy(app.username, tmp, sizeof(app.username));
@@ -207,10 +208,11 @@ static void open_keyboard(void) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// main
-// ---------------------------------------------------------------------------
+/* -------------------------------------------------------------------------
+ * main
+ * ---------------------------------------------------------------------- */
 int main(int argc, char *argv[]) {
+    (void)argc; (void)argv;
     gfxInitDefault();
     ui_init();
 
@@ -218,12 +220,12 @@ int main(int argc, char *argv[]) {
     safe_strncpy(app.status_message, "Scan QR code, then enter PIN",
                  sizeof(app.status_message));
     safe_strncpy(app.uuid, "3DS-Pronote-Device", sizeof(app.uuid));
-    app.screen      = SCREEN_LOGIN;
+    app.screen       = SCREEN_LOGIN;
     app.needs_redraw = 1;
 
     while (aptMainLoop()) {
 
-        // ---- QR scan mode ----
+        /* ---- QR scan mode ---- */
         if (app.screen == SCREEN_QR_SCAN) {
             char qr_result[MAX_JETON_LEN + MAX_USERNAME_LEN + 64] = {0};
             int  rc = qr_scan(qr_result, sizeof(qr_result));
@@ -231,12 +233,11 @@ int main(int argc, char *argv[]) {
             if (rc == QR_SUCCESS) {
                 char *lp = strstr(qr_result, "\"login\":");
                 char *jp = strstr(qr_result, "\"jeton\":");
-
                 if (lp && jp) {
                     lp += 9;
                     char *e = strchr(lp, '"');
                     if (e) {
-                        size_t n = e - lp;
+                        size_t n = (size_t)(e - lp);
                         if (n >= MAX_USERNAME_LEN) n = MAX_USERNAME_LEN - 1;
                         memcpy(app.username, lp, n);
                         app.username[n] = '\0';
@@ -244,7 +245,7 @@ int main(int argc, char *argv[]) {
                     jp += 9;
                     e = strchr(jp, '"');
                     if (e) {
-                        size_t n = e - jp;
+                        size_t n = (size_t)(e - jp);
                         if (n >= MAX_JETON_LEN) n = MAX_JETON_LEN - 1;
                         memcpy(app.jeton, jp, n);
                         app.jeton[n] = '\0';
@@ -264,12 +265,15 @@ int main(int argc, char *argv[]) {
                              sizeof(app.status_message));
             }
 
-            app.screen      = SCREEN_LOGIN;
+            app.screen       = SCREEN_LOGIN;
             app.needs_redraw = 1;
+            /* Re-init citro2d after console mode used by qr_scan */
+            ui_exit();
+            ui_init();
             continue;
         }
 
-        // ---- Login screen input ----
+        /* ---- Login screen input ---- */
         hidScanInput();
         u32 kdown = hidKeysDown();
 
@@ -277,11 +281,11 @@ int main(int argc, char *argv[]) {
 
         if (kdown & KEY_UP) {
             app.current_field = (app.current_field - 1 + 3) % 3;
-            app.needs_redraw = 1;
+            app.needs_redraw  = 1;
         }
         if (kdown & KEY_DOWN) {
             app.current_field = (app.current_field + 1) % 3;
-            app.needs_redraw = 1;
+            app.needs_redraw  = 1;
         }
         if (kdown & KEY_A) {
             open_keyboard();
@@ -294,14 +298,18 @@ int main(int argc, char *argv[]) {
             app.needs_redraw = 1;
         }
         if (kdown & KEY_X) {
-            if      (strlen(app.username) == 0)
-                safe_strncpy(app.status_message, "Enter username first!", sizeof(app.status_message));
+            if (strlen(app.username) == 0)
+                safe_strncpy(app.status_message, "Enter username first!",
+                             sizeof(app.status_message));
             else if (strlen(app.jeton) == 0)
-                safe_strncpy(app.status_message, "Scan QR code first!", sizeof(app.status_message));
+                safe_strncpy(app.status_message, "Scan QR code first!",
+                             sizeof(app.status_message));
             else if (strlen(app.pin) != 4)
-                safe_strncpy(app.status_message, "PIN must be 4 digits!", sizeof(app.status_message));
+                safe_strncpy(app.status_message, "PIN must be 4 digits!",
+                             sizeof(app.status_message));
             else {
-                safe_strncpy(app.status_message, "Decrypting... (coming soon)", sizeof(app.status_message));
+                safe_strncpy(app.status_message, "Decrypting... (coming soon)",
+                             sizeof(app.status_message));
                 app.logged_in = 1;
             }
             app.needs_redraw = 1;
