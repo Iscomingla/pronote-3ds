@@ -7,6 +7,18 @@
  *   ui_clear_target(ui_get_target(GFX_BOTTOM), COL_BG);
  *   ui_target(GFX_TOP);    // draw ...
  *   ui_target(GFX_BOTTOM); // draw ...
+ * Design notes:
+ *   - C2D_FontLoadSystem(CFG_REGION_EUR) is called once and cached.
+ *     EUR covers the full Latin charset and works on all 3DS regions.
+ *     If it returns NULL (some firmwares), we fall back to the built-in
+ *     default font via C2D_TextFontParse with font=NULL.
+ *   - The text buffer is cleared at the start of every frame (ui_frame_begin)
+ *     so it never grows unboundedly across frames.
+ *   - s_cur tracks the currently active render target so callers don't
+ *     need to pass it through every primitive call.
+ *   - ui_clear() MUST be called before ui_target() switches the scene,
+ *     i.e. call ui_clear() then ui_target() — NOT the other way around.
+ *     C2D_TargetClear must happen before C2D_SceneBegin.
  */
 
 #include "ui.h"
@@ -17,7 +29,7 @@ static C3D_RenderTarget *s_bot  = NULL;
 static C3D_RenderTarget *s_cur  = NULL;
 
 static C2D_TextBuf s_tbuf;
-static C2D_Font    s_font = NULL;
+static C2D_Font    s_font = NULL;   /* system font, or NULL = built-in default */
 
 void ui_init(void) {
     C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
@@ -30,8 +42,13 @@ void ui_init(void) {
 
     s_tbuf = C2D_TextBufNew(1024);
 
-    /* May return NULL on some firmwares — NULL is handled gracefully below */
+    /*
+     * CFG_REGION_EUR: full Latin charset, works on all console regions.
+     * May return NULL on some firmwares — we keep s_font = NULL in that
+     * case and pass NULL to C2D_TextFontParse, which uses the built-in font.
+     */
     s_font = C2D_FontLoadSystem(CFG_REGION_EUR);
+    /* s_font == NULL is handled gracefully — no crash */
 }
 
 void ui_exit(void) {
@@ -57,6 +74,15 @@ C3D_RenderTarget *ui_get_target(gfxScreen_t screen) {
     return (screen == GFX_TOP) ? s_top : s_bot;
 }
 
+/* -------------------------------------------------------------------------
+ * Target selection
+ * ---------------------------------------------------------------------- */
+
+/*
+ * ui_clear_target — clear a render target.
+ * MUST be called BEFORE ui_target() for that screen, because
+ * C2D_TargetClear must happen before C2D_SceneBegin.
+ */
 void ui_clear_target(C3D_RenderTarget *t, u32 colour) {
     C2D_TargetClear(t, colour);
 }
@@ -66,7 +92,24 @@ void ui_target(gfxScreen_t screen) {
     C2D_SceneBegin(s_cur);
 }
 
+C3D_RenderTarget *ui_get_target(gfxScreen_t screen) {
+    return (screen == GFX_TOP) ? s_top : s_bot;
+}
+
+/* -------------------------------------------------------------------------
+ * Primitives
+ * ---------------------------------------------------------------------- */
 void ui_clear(u32 colour) {
+    /*
+     * C2D_TargetClear must happen BEFORE C2D_SceneBegin (i.e. before
+     * ui_target). Callers must use the pattern:
+     *   ui_clear_target(ui_get_target(GFX_TOP), COL_BG);
+     *   ui_target(GFX_TOP);
+     *   ... draw calls ...
+     * This function clears the CURRENT target and is safe only if called
+     * before any draw calls on a freshly begun scene — kept for compat but
+     * prefer ui_clear_target().
+     */
     C2D_TargetClear(s_cur, colour);
 }
 

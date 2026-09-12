@@ -84,7 +84,7 @@ static void draw_login_screen(void) {
 
     /*
      * C2D_TargetClear MUST come before C2D_SceneBegin (ui_target).
-     * Clear both targets upfront, then begin each scene to draw.
+     * Clear both targets upfront, then enter each scene to draw into it.
      */
     ui_clear_target(ui_get_target(GFX_TOP),    COL_BG);
     ui_clear_target(ui_get_target(GFX_BOTTOM), COL_BG);
@@ -107,9 +107,7 @@ static void draw_login_screen(void) {
 
     snprintf(lbl, sizeof(lbl), "Pronote QR%s",
              app.current_field == 1 ? "  [A: scan]" : "");
-    const char *qr_val = strlen(app.jeton) > 0
-                         ? "Scanned \xe2\x9c\x93"
-                         : "Not scanned";
+    const char *qr_val = strlen(app.jeton) > 0 ? "Scanned \xe2\x9c\x93" : "Not scanned";
     draw_field(fy, lbl, qr_val, 0, app.current_field == 1);
     fy += FIELD_H + FIELD_GAP;
 
@@ -117,8 +115,7 @@ static void draw_login_screen(void) {
              app.current_field == 2 ? "  [A: enter]" : "");
     draw_field(fy, lbl, app.pin, 1, app.current_field == 2);
 
-    ui_rect(0, STATUS_Y, SCREEN_TOP_W, STATUS_H,
-            C2D_Color32(0x00, 0x50, 0x40, 0xCC));
+    ui_rect(0, STATUS_Y, SCREEN_TOP_W, STATUS_H, C2D_Color32(0x00, 0x50, 0x40, 0xCC));
     ui_hline(0, STATUS_Y, SCREEN_TOP_W, COL_LINE2);
     ui_text(8.0f, STATUS_Y + 2.0f, 0.45f, COL_WHITE, app.status_message);
 
@@ -185,10 +182,10 @@ int main(int argc, char *argv[]) {
     (void)argc; (void)argv;
 
     /*
-     * gfxInitDefault() acquires GSP ownership and brings up the LCD.
-     * It MUST be called before C3D_Init (inside ui_init), otherwise
-     * GSP is uninitialised and the display stays black.
-     * gfxExit() must be called after ui_exit() for the same reason.
+     * gfxInitDefault() brings up the LCD and GSP service — required first.
+     * C3D_Init() (inside ui_init()) then takes over the GPU command pipe
+     * on top of that. Both are needed; gfxExit() cleans up on exit.
+     * Every official citro2d/citro3d example follows this same order.
      */
     gfxInitDefault();
     ui_init();
