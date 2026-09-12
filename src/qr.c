@@ -1,10 +1,15 @@
 /*
  * qr.c -- QR code scanner: 3DS outer camera + quirc.
  *
- * GSP conflict fix: citro3d holds a GSP session that the camera sysmodule
- * cannot share. We call ui_suspend() to tear down C3D/C2D before camInit(),
- * and ui_resume() to bring them back after camExit(). This is the only
- * safe way to run the camera alongside citro3d on real hardware.
+ * Two hardware requirements on real 3DS:
+ *
+ * 1. GSP conflict: citro3d holds a GSP session the camera sysmodule cannot
+ *    share. ui_suspend() tears down C3D/C2D before camInit(); ui_resume()
+ *    brings them back after camExit().
+ *
+ * 2. Linear heap: the camera DMA engine can only write to physical linear
+ *    memory. calloc/malloc give standard heap — unusable for DMA on hardware.
+ *    cam_buf must be allocated with linearAlloc() and freed with linearFree().
  */
 
 #include <3ds.h>
@@ -73,18 +78,19 @@ int qr_scan(char *out_buf, size_t out_len) {
         return QR_ERROR;
     }
 
-    /* 4. Camera buffer */
-    u16 *cam_buf = (u16 *)calloc(1, CAM_BUF_SZ);
+    /* 4. Camera buffer in LINEAR heap — required for DMA on real hardware */
+    u16 *cam_buf = (u16 *)linearAlloc(CAM_BUF_SZ);
     if (!cam_buf) {
         quirc_destroy(qrc);
         ui_resume();
         return QR_ERROR;
     }
+    memset(cam_buf, 0, CAM_BUF_SZ);
 
     /* 5. Camera init */
     Result res = camInit();
     if (R_FAILED(res)) {
-        free(cam_buf);
+        linearFree(cam_buf);
         quirc_destroy(qrc);
         ui_resume();
         return QR_ERROR;
@@ -156,7 +162,7 @@ done:
     CAMU_StopCapture(PORT_CAM1);
     CAMU_Activate(SELECT_NONE);
     svcCloseHandle(recv_event);
-    free(cam_buf);
+    linearFree(cam_buf);
     camExit();
     quirc_destroy(qrc);
 
