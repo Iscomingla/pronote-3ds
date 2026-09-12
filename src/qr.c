@@ -6,14 +6,14 @@
 #include "../lib/quirc/quirc.h"
 
 // QR scanner using 3DS camera and quirc library.
-// Camera setup and buffer handling matches FBI-NH's capturecam.c exactly.
+// Camera display is intentionally omitted here — it will be re-added
+// once the UI switches to citro2d/citro3d (see TODO: camera preview).
 
 #define CAM_WIDTH  400
 #define CAM_HEIGHT 240
 // Total buffer size: width * height * sizeof(u16).
 // transferUnit from CAMU_GetMaxBytes is the line pitch only, not the total.
 #define CAM_BUF_SIZE (CAM_WIDTH * CAM_HEIGHT * sizeof(u16))
-#define FB_BPP 3
 
 static struct quirc *qr_ctx = NULL;
 
@@ -35,58 +35,22 @@ static void destroy_qr_scanner() {
     }
 }
 
-// Blit RGB565 camera buffer (row-major) to the top-screen framebuffer
-// (column-major BGR8, portrait orientation).
-// fb_h = GSP_SCREEN_WIDTH = 240 (column height, from gfxGetFramebuffer).
-// pixel (cx, cy) -> fb offset: (cx * fb_h + (fb_h - 1 - cy)) * FB_BPP
-static void blit_camera_to_fb(u8 *fb, const u16 *cam, u16 fb_h) {
-    for (int cy = 0; cy < CAM_HEIGHT; cy++) {
-        for (int cx = 0; cx < CAM_WIDTH; cx++) {
-            u16 px = cam[cy * CAM_WIDTH + cx];
-            u8 r = ((px >> 11) & 0x1F) << 3;
-            u8 g = ((px >>  5) & 0x3F) << 2;
-            u8 b =  (px        & 0x1F) << 3;
-            u32 off = ((u32)cx * fb_h + (fb_h - 1 - cy)) * FB_BPP;
-            fb[off + 0] = b;  // libctru BGR8
-            fb[off + 1] = g;
-            fb[off + 2] = r;
-        }
-    }
-}
-
-static void draw_crosshair(u8 *fb, u16 fb_h) {
-    const int cx  = CAM_WIDTH  / 2;
-    const int cy  = CAM_HEIGHT / 2;
-    const int arm = 28;
-    const int gap = 7;
-    for (int i = gap; i <= arm; i++) {
-        int coords[4][2] = {
-            {cx + i, cy}, {cx - i, cy},
-            {cx, cy + i}, {cx, cy - i},
-        };
-        for (int k = 0; k < 4; k++) {
-            int px = coords[k][0], py = coords[k][1];
-            if (px < 0 || px >= CAM_WIDTH || py < 0 || py >= CAM_HEIGHT) continue;
-            u32 off = ((u32)px * fb_h + (fb_h - 1 - py)) * FB_BPP;
-            fb[off + 0] = 0;
-            fb[off + 1] = 255;
-            fb[off + 2] = 0;
-        }
-    }
-}
-
 int qr_scan(char *out_buf, size_t out_len) {
     if (init_qr_scanner() != 0) return QR_ERROR;
 
-    gfxSetDoubleBuffering(GFX_TOP, true);
-
+    // Instructions on bottom screen
     consoleInit(GFX_BOTTOM, NULL);
     consoleClear();
     printf("\x1b[2;0H");
     printf("=== QR CODE SCANNER ===\n\n");
-    printf("Point camera at Pronote QR\n");
-    printf("code shown on TOP screen.\n\n");
+    printf("Point camera at your\n");
+    printf("Pronote QR code.\n\n");
     printf("B: Cancel\n");
+    gfxFlushBuffers();
+    gfxSwapBuffers();
+
+    // Top screen: plain black while scanning (no preview yet)
+    consoleClear();
     gfxFlushBuffers();
     gfxSwapBuffers();
 
@@ -99,8 +63,6 @@ int qr_scan(char *out_buf, size_t out_len) {
     CAMU_SetAutoWhiteBalance(SELECT_OUT1, true);
     CAMU_Activate(SELECT_OUT1);
 
-    // transferUnit is the line pitch in bytes (CAMU_GetMaxBytes).
-    // Only used as the last argument to CAMU_SetReceiving, matching FBI.
     u32 transferUnit = 0;
     CAMU_GetMaxBytes(&transferUnit, CAM_WIDTH, CAM_HEIGHT);
     CAMU_SetTransferBytes(PORT_CAM1, transferUnit, CAM_WIDTH, CAM_HEIGHT);
@@ -115,10 +77,6 @@ int qr_scan(char *out_buf, size_t out_len) {
     CAMU_ClearBuffer(PORT_CAM1);
     CAMU_StartCapture(PORT_CAM1);
 
-    // fb_h = GSP_SCREEN_WIDTH = 240 (portrait column height)
-    u16 fb_h = 0;
-    gfxGetFramebuffer(GFX_TOP, GFX_LEFT, &fb_h, NULL);
-
     int result = QR_CANCELLED;
 
     while (aptMainLoop()) {
@@ -131,23 +89,12 @@ int qr_scan(char *out_buf, size_t out_len) {
         Handle cam_event = 0;
         svcCreateEvent(&cam_event, RESET_ONESHOT);
 
-        // Flush CPU cache before handing buffer to DMA so the DMA engine
-        // doesn't see dirty cache lines being written back over its data.
+        // Flush before DMA write, invalidate after — required for cache coherency.
         GSPGPU_FlushDataCache(cam_buf, CAM_BUF_SIZE);
-
         CAMU_SetReceiving(&cam_event, cam_buf, PORT_CAM1, CAM_BUF_SIZE, (s16)transferUnit);
         svcWaitSynchronization(cam_event, 400000000LL);
         svcCloseHandle(cam_event);
-
-        // Invalidate CPU cache after DMA completes so the CPU reads the
-        // freshly DMA-written data instead of stale cached zeros.
         GSPGPU_InvalidateDataCache(cam_buf, CAM_BUF_SIZE);
-
-        u8 *fb = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, NULL, NULL);
-        blit_camera_to_fb(fb, cam_buf, fb_h);
-        draw_crosshair(fb, fb_h);
-        gfxFlushBuffers();
-        gfxSwapBuffers();
 
         // Feed grayscale to quirc
         int w, h;
@@ -186,6 +133,7 @@ int qr_scan(char *out_buf, size_t out_len) {
     camExit();
     destroy_qr_scanner();
 
+    // Restore top screen for login UI
     consoleInit(GFX_TOP, NULL);
 
     return result;
