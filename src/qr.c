@@ -37,6 +37,10 @@
 #define CAM_BUF_SZ       (CAM_WIDTH * CAM_HEIGHT * sizeof(u16))
 #define RECV_TIMEOUT_NS  400000000LL   // 400 ms — one frame at 30 fps + margin
 
+/* "Hold B" at size 0.50f is ~56 px wide; add 8 px gap → desc at 80.0f */
+#define QR_BTN_X   16.0f
+#define QR_DESC_X  80.0f
+
 static void draw_qr_screen(void) {
     ui_frame_begin();
 
@@ -62,10 +66,10 @@ static void draw_qr_screen(void) {
     ui_text_centred(0, SCREEN_BOT_W, 8.0f, 0.65f, COL_WHITE, "QR Scanner");
     ui_hline(0, 36.0f, SCREEN_BOT_W, COL_LINE1);
     float cy = 52.0f;
-    ui_text_centred(0, SCREEN_BOT_W, cy,   0.50f, COL_WHITE,  "Scanning for QR code...");
+    ui_text_centred(0, SCREEN_BOT_W, cy, 0.50f, COL_WHITE, "Scanning for QR code...");
     cy += 30.0f;
-    ui_text(16.0f, cy, 0.50f, COL_LINE1, "Hold B");
-    ui_text(72.0f, cy, 0.50f, COL_WHITE, "to cancel");
+    ui_text(QR_BTN_X,  cy, 0.50f, COL_LINE1, "Hold B");
+    ui_text(QR_DESC_X, cy, 0.50f, COL_WHITE,  "to cancel");
     cy += 28.0f;
     ui_text_centred(0, SCREEN_BOT_W, cy, 0.42f, COL_DIMTEXT,
                     "Auto-detected when in frame");
