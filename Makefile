@@ -12,7 +12,7 @@ include $(DEVKITARM)/3ds_rules
 #---------------------------------------------------------------------------------
 TARGET			:=	$(notdir $(CURDIR))
 BUILD			:=	build
-SOURCES			:=	src lib/quirc
+SOURCES			:=	src lib/quirc lib/aes lib/md5
 DATA			:=	data
 INCLUDES		:=	include lib
 GRAPHICS		:=	gfx

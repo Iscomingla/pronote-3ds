@@ -6,18 +6,13 @@
 #include "network.h"
 #include "qr.h"
 #include "log.h"
+#include "crypto.h"
 
-/*
- * The jeton is a hex-encoded AES-CBC ciphertext.
- * 512 chars gives comfortable headroom beyond any observed real-world value.
- */
 #define MAX_USERNAME_LEN  64
-#define MAX_JETON_LEN    513   /* 512 usable chars + null */
-#define MAX_PIN            5   /* 4 digits + null */
+#define MAX_JETON_LEN    513
+#define MAX_PIN            5
+#define MAX_PLAIN_LEN    513   /* plaintext jeton after decryption */
 
-/* ---------------------------------------------------------------------------
- * Layout constants
- * --------------------------------------------------------------------------- */
 #define HEADER_H    36.0f
 #define STRIPE1_Y   HEADER_H
 #define STRIPE1_H    4.0f
@@ -30,7 +25,6 @@
 #define FIELD_W     (SCREEN_TOP_W - FIELD_X * 2.0f)
 #define STATUS_H    18.0f
 #define STATUS_Y    (SCREEN_H - STATUS_H)
-
 #define CTRL_KEY_X   12.0f
 #define CTRL_DESC_X  64.0f
 
@@ -97,7 +91,6 @@ static void draw_login_screen(void) {
     ui_clear_target(ui_get_target(GFX_BOTTOM), COL_BG);
 
     ui_target(GFX_TOP);
-
     ui_rect(0, 0, SCREEN_TOP_W, HEADER_H, C2D_Color32(0x00, 0x60, 0x52, 0xFF));
     ui_text_centred(0, SCREEN_TOP_W, 8.0f, 0.65f, COL_WHITE, "notApro");
     ui_rect(0, STRIPE1_Y, SCREEN_TOP_W, STRIPE1_H, COL_LINE1);
@@ -128,7 +121,6 @@ static void draw_login_screen(void) {
     ui_text(8.0f, STATUS_Y + 2.0f, 0.45f, COL_WHITE, app.status_message);
 
     ui_target(GFX_BOTTOM);
-
     ui_rect(0, 0, SCREEN_BOT_W, HEADER_H, C2D_Color32(0x00, 0x60, 0x52, 0xFF));
     ui_text_centred(0, SCREEN_BOT_W, 8.0f, 0.65f, COL_WHITE, "Controls");
     ui_hline(0, HEADER_H, SCREEN_BOT_W, COL_LINE1);
@@ -187,6 +179,47 @@ static void open_keyboard(void) {
     }
 }
 
+static void do_login(void) {
+    if (strlen(app.username) == 0) {
+        LOG("login: no username");
+        safe_strncpy(app.status_message, "Enter username first!",
+                     sizeof(app.status_message));
+        return;
+    }
+    if (strlen(app.jeton) == 0) {
+        LOG("login: no jeton");
+        safe_strncpy(app.status_message, "Scan QR code first!",
+                     sizeof(app.status_message));
+        return;
+    }
+    if (strlen(app.pin) != 4) {
+        LOG("login: PIN length %zu (expected 4)", strlen(app.pin));
+        safe_strncpy(app.status_message, "PIN must be 4 digits!",
+                     sizeof(app.status_message));
+        return;
+    }
+
+    LOG("login: decrypting jeton for user=%s", app.username);
+    safe_strncpy(app.status_message, "Decrypting jeton...",
+                 sizeof(app.status_message));
+    draw_login_screen(); /* show status immediately */
+
+    char plain[MAX_PLAIN_LEN];
+    int rc = pronote_decrypt_jeton(app.jeton, app.pin, plain, sizeof(plain));
+    if (rc != 0) {
+        LOG("login: decryption failed");
+        safe_strncpy(app.status_message, "Decryption failed — wrong PIN?",
+                     sizeof(app.status_message));
+        return;
+    }
+
+    LOG("login: jeton decrypted: %s", plain);
+    /* TODO: pass plain (decrypted jeton) + username to HTTP login */
+    safe_strncpy(app.status_message, "Jeton decrypted! (HTTP login coming soon)",
+                 sizeof(app.status_message));
+    app.logged_in = 1;
+}
+
 int main(int argc, char *argv[]) {
     (void)argc; (void)argv;
 
@@ -214,7 +247,6 @@ int main(int argc, char *argv[]) {
                 LOG("QR scan success, raw len=%zu", strlen(qr_result));
                 char *lp = strstr(qr_result, "\"login\":");
                 char *jp = strstr(qr_result, "\"jeton\":");
-
                 if (lp && jp) {
                     lp += 9;
                     char *e = strchr(lp, '"');
@@ -264,7 +296,6 @@ int main(int argc, char *argv[]) {
             LOG("exit requested");
             break;
         }
-
         if (kdown & KEY_UP) {
             app.current_field = (app.current_field - 1 + 3) % 3;
             app.needs_redraw  = 1;
@@ -285,24 +316,7 @@ int main(int argc, char *argv[]) {
             app.needs_redraw = 1;
         }
         if (kdown & KEY_X) {
-            if (strlen(app.username) == 0) {
-                LOG("login attempt: no username");
-                safe_strncpy(app.status_message, "Enter username first!",
-                             sizeof(app.status_message));
-            } else if (strlen(app.jeton) == 0) {
-                LOG("login attempt: no jeton");
-                safe_strncpy(app.status_message, "Scan QR code first!",
-                             sizeof(app.status_message));
-            } else if (strlen(app.pin) != 4) {
-                LOG("login attempt: PIN length %zu (expected 4)", strlen(app.pin));
-                safe_strncpy(app.status_message, "PIN must be 4 digits!",
-                             sizeof(app.status_message));
-            } else {
-                LOG("login attempt: user=%s, jeton_len=%zu", app.username, strlen(app.jeton));
-                safe_strncpy(app.status_message, "Decrypting... (coming soon)",
-                             sizeof(app.status_message));
-                app.logged_in = 1;
-            }
+            do_login();
             app.needs_redraw = 1;
         }
 
