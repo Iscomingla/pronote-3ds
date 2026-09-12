@@ -12,20 +12,34 @@
  *                  so CAMU_SetReceiving is only re-armed after the recv event
  *                  fires -- never while the previous DMA is in flight.
  *
- * Resolution strategy:
- *   The Pronote QR is version 14 (73x73 modules). At 400x240 that is only
- *   ~3px per module vertically, which is too little for quirc's Otsu
- *   thresholder to reliably separate black from white cells.
+ * Decode strategy (DATA_ECC fix):
  *
- *   Fix: feed quirc at half resolution (200x120) by 2x2 box-averaging when
- *   converting to greyscale. This doubles the effective module size to ~6px
- *   and makes Otsu work correctly. The camera preview still uses the full
- *   400x240 buffer so the display is unaffected.
+ *   The Pronote QR is version 13-14 (69-73 modules). At 400x240 the module
+ *   pitch is only ~3px -- too small for quirc's global Otsu threshold to
+ *   reliably binarise the image. Error 4 = QUIRC_ERROR_DATA_ECC means quirc
+ *   finds the finder patterns and grid fine, but sampling noise fills the ECC
+ *   correction budget before the data is recovered.
  *
- * Stack note: the following are declared static to avoid stack overflow:
- *   s_grey_buf  -- 24000 bytes (200*120 greyscale, half-res)
- *   s_qr_code   -- ~3940 bytes
- *   s_qr_data   -- ~8910 bytes
+ *   Fix -- two layers:
+ *
+ *   1. Multi-scale: each frame is fed to quirc at three resolutions:
+ *        4x4 box-avg  -> 100x60  (~6px/module for v13) -- best for small QR
+ *        3x3 box-avg  -> 133x80  (~4.7px/module)
+ *        2x2 box-avg  -> 200x120 (~3.5px/module) -- original
+ *      quirc is run three times; whichever succeeds first wins.
+ *
+ *   2. Local adaptive threshold (mean-based, 15x15 window, bias -10):
+ *      Applied after box-averaging. Replaces quirc's internal global Otsu,
+ *      which fails when the QR only covers part of the frame (background
+ *      brightness skews the histogram). We binarise ourselves and hand
+ *      quirc a clean black/white image so its thresholder is a no-op.
+ *      (quirc thresholds any image handed to it, but if it's already
+ *      binarised to 0/255 Otsu will just pick 128 and preserve it.)
+ *
+ * Stack note: large buffers are declared static to avoid stack overflow.
+ *   s_grey_*   -- greyscale buffers for each scale
+ *   s_qr_code  -- ~3940 bytes
+ *   s_qr_data  -- ~8910 bytes
  */
 
 #include <3ds.h>
@@ -41,9 +55,17 @@
 #define CAM_HEIGHT   240
 #define CAM_BUF_SZ   (CAM_WIDTH * CAM_HEIGHT * sizeof(u16))
 
-/* Half-resolution quirc input */
-#define QR_WIDTH     (CAM_WIDTH  / 2)   /* 200 */
-#define QR_HEIGHT    (CAM_HEIGHT / 2)   /* 120 */
+/* Downsample scales tried per frame, largest-to-smallest */
+#define SCALE_4  4    /* 100 x  60 */
+#define SCALE_3  3    /* 133 x  80 */
+#define SCALE_2  2    /* 200 x 120 */
+
+#define W4  (CAM_WIDTH  / SCALE_4)   /* 100 */
+#define H4  (CAM_HEIGHT / SCALE_4)   /*  60 */
+#define W3  (CAM_WIDTH  / SCALE_3)   /* 133 */
+#define H3  (CAM_HEIGHT / SCALE_3)   /*  80 */
+#define W2  (CAM_WIDTH  / SCALE_2)   /* 200 */
+#define H2  (CAM_HEIGHT / SCALE_2)   /* 120 */
 
 #define EV_CANCEL  0
 #define EV_RECV    1
@@ -59,7 +81,7 @@ typedef struct {
 } cam_ctx_t;
 
 // ---------------------------------------------------------------------------
-// Camera thread
+// Camera thread (unchanged from before)
 // ---------------------------------------------------------------------------
 static void cam_thread_fn(void *arg) {
     cam_ctx_t *ctx = (cam_ctx_t *)arg;
@@ -162,11 +184,104 @@ cleanup_linear:
 }
 
 // ---------------------------------------------------------------------------
-// Static buffers -- keep off the stack
+// Static buffers -- keep large structs off the stack
 // ---------------------------------------------------------------------------
-static u8                s_grey_buf[QR_WIDTH * QR_HEIGHT];  /* 200x120 */
+static u8 s_grey4[W4 * H4];   /* 100x60  -- scale 4x4 */
+static u8 s_grey3[W3 * H3];   /* 133x80  -- scale 3x3 */
+static u8 s_grey2[W2 * H2];   /* 200x120 -- scale 2x2 */
+
 static struct quirc_code s_qr_code;
 static struct quirc_data s_qr_data;
+
+// ---------------------------------------------------------------------------
+// box_avg_luma: downsample RGB565 src (srcW x srcH) into dst (dstW x dstH)
+// using SxS box averaging + BT.601 luma.
+// S = srcW/dstW = srcH/dstH (must be integer).
+// ---------------------------------------------------------------------------
+static void box_avg_luma(const u16 *src, int srcW, u8 *dst, int dstW, int dstH, int S) {
+    int S2 = S * S;
+    for (int qy = 0; qy < dstH; qy++) {
+        for (int qx = 0; qx < dstW; qx++) {
+            u32 sum = 0;
+            for (int dy = 0; dy < S; dy++) {
+                for (int dx = 0; dx < S; dx++) {
+                    u16 px = src[(qy * S + dy) * srcW + (qx * S + dx)];
+                    u32 r8 = ((px >> 11) & 0x1F) << 3;
+                    u32 g8 = ((px >>  5) & 0x3F) << 2;
+                    u32 b8 =  (px        & 0x1F) << 3;
+                    sum += (r8 * 77 + g8 * 150 + b8 * 29) >> 8;
+                }
+            }
+            dst[qy * dstW + qx] = (u8)(sum / S2);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// local_adaptive_threshold: mean-based adaptive binarisation in-place.
+// window = WxW neighbourhood, bias subtracted from local mean before compare.
+// Output: 0 (black) or 255 (white).
+// W must be odd. Using W=15, bias=10 works well for camera-captured QRs.
+// ---------------------------------------------------------------------------
+static void local_adaptive_threshold(u8 *img, int w, int h, int W, int bias) {
+    int half = W / 2;
+    /* Use a simple sliding-window sum; good enough for small images. */
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            int x0 = x - half < 0     ? 0     : x - half;
+            int x1 = x + half >= w    ? w - 1 : x + half;
+            int y0 = y - half < 0     ? 0     : y - half;
+            int y1 = y + half >= h    ? h - 1 : y + half;
+            u32 sum = 0, count = 0;
+            for (int sy = y0; sy <= y1; sy++) {
+                for (int sx = x0; sx <= x1; sx++) {
+                    sum += img[sy * w + sx];
+                    count++;
+                }
+            }
+            u8 mean = (u8)(sum / count);
+            img[y * w + x] = img[y * w + x] < (int)mean - bias ? 0 : 255;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// try_decode: feed buf (w x h) to qrc, try normal + flipped, return true on success
+// ---------------------------------------------------------------------------
+static bool try_decode(struct quirc *qrc, u8 *buf, int w, int h,
+                       int frame, int scale) {
+    int qw = 0, qh = 0;
+    uint8_t *qimg = quirc_begin(qrc, &qw, &qh);
+    memcpy(qimg, buf, (size_t)qw * qh);
+    quirc_end(qrc);
+
+    int n = quirc_count(qrc);
+    if (n == 0) return false;
+
+    LOG("qr_scan: frame %d scale %dx -- %d code(s)", frame, scale, n);
+
+    for (int i = 0; i < n; i++) {
+        quirc_extract(qrc, i, &s_qr_code);
+        LOG("qr_scan: frame %d scale %dx code %d size=%d (v%d)",
+            frame, scale, i, s_qr_code.size, (s_qr_code.size - 17) / 4);
+
+        quirc_decode_error_t err = quirc_decode(&s_qr_code, &s_qr_data);
+        if (err == QUIRC_SUCCESS) {
+            LOG("qr_scan: decoded (normal) frame %d scale %dx", frame, scale);
+            return true;
+        }
+        LOG("qr_scan: normal decode err %d (scale %dx)", (int)err, scale);
+
+        quirc_flip(&s_qr_code);
+        err = quirc_decode(&s_qr_code, &s_qr_data);
+        if (err == QUIRC_SUCCESS) {
+            LOG("qr_scan: decoded (flipped) frame %d scale %dx", frame, scale);
+            return true;
+        }
+        LOG("qr_scan: flipped decode err %d (scale %dx)", (int)err, scale);
+    }
+    return false;
+}
 
 // ---------------------------------------------------------------------------
 // qr_scan
@@ -187,10 +302,18 @@ int qr_scan(char *out_buf, size_t out_len) {
     }
     ctx->finished = false;
 
-    /* quirc at half resolution */
-    struct quirc *qrc = quirc_new();
-    if (!qrc || quirc_resize(qrc, QR_WIDTH, QR_HEIGHT) < 0) {
-        if (qrc) quirc_destroy(qrc);
+    /* Three quirc instances -- one per scale */
+    struct quirc *qrc4 = quirc_new();
+    struct quirc *qrc3 = quirc_new();
+    struct quirc *qrc2 = quirc_new();
+    if (!qrc4 || !qrc3 || !qrc2
+     || quirc_resize(qrc4, W4, H4) < 0
+     || quirc_resize(qrc3, W3, H3) < 0
+     || quirc_resize(qrc2, W2, H2) < 0) {
+        LOG("qr_scan: quirc init failed");
+        if (qrc4) quirc_destroy(qrc4);
+        if (qrc3) quirc_destroy(qrc3);
+        if (qrc2) quirc_destroy(qrc2);
         svcCloseHandle(ctx->cancel_event);
         svcCloseHandle(ctx->mutex);
         free(ctx->shared_buf); free(ctx);
@@ -203,7 +326,7 @@ int qr_scan(char *out_buf, size_t out_len) {
     if (!cam_thread) {
         LOG("qr_scan: threadCreate failed");
         ui_cam_tex_free();
-        quirc_destroy(qrc);
+        quirc_destroy(qrc4); quirc_destroy(qrc3); quirc_destroy(qrc2);
         svcCloseHandle(ctx->cancel_event);
         svcCloseHandle(ctx->mutex);
         free(ctx->shared_buf); free(ctx);
@@ -220,11 +343,11 @@ int qr_scan(char *out_buf, size_t out_len) {
             break;
         }
 
+        /* Render frame */
         ui_frame_begin();
         ui_clear_target(ui_get_target(GFX_TOP),    COL_BLACK);
         ui_clear_target(ui_get_target(GFX_BOTTOM), COL_BG);
 
-        /* Upload full-res frame for display */
         svcWaitSynchronization(ctx->mutex, U64_MAX);
         ui_cam_tex_upload(ctx->shared_buf, CAM_WIDTH, CAM_HEIGHT);
         svcReleaseMutex(ctx->mutex);
@@ -232,22 +355,21 @@ int qr_scan(char *out_buf, size_t out_len) {
         ui_target(GFX_TOP);
         ui_cam_tex_draw(0.0f, 0.0f, (float)SCREEN_TOP_W, (float)SCREEN_H);
 
-        /* Crosshair overlay */
-        float cx  = SCREEN_TOP_W / 2.0f;
-        float cy  = SCREEN_H      / 2.0f;
+        /* Crosshair */
+        float cx = SCREEN_TOP_W / 2.0f, cy_f = SCREEN_H / 2.0f;
         float arm = 28.0f, gap = 7.0f;
-        ui_rect(cx - arm, cy - 1.0f, (arm - gap) * 2.0f, 2.0f, COL_LINE1);
-        ui_rect(cx - 1.0f, cy - arm, 2.0f, (arm - gap) * 2.0f, COL_LINE1);
+        ui_rect(cx - arm,  cy_f - 1.0f, (arm - gap) * 2.0f, 2.0f, COL_LINE1);
+        ui_rect(cx - 1.0f, cy_f - arm,  2.0f, (arm - gap) * 2.0f, COL_LINE1);
 
         ui_target(GFX_BOTTOM);
         ui_rect(0, 0, SCREEN_BOT_W, 36.0f, C2D_Color32(0x00, 0x60, 0x52, 0xFF));
-        ui_text_centred(0, SCREEN_BOT_W, 8.0f, 0.65f, COL_WHITE, "QR Scanner");
+        ui_text_centred(0, SCREEN_BOT_W, 8.0f,  0.65f, COL_WHITE, "QR Scanner");
         ui_hline(0, 36.0f, SCREEN_BOT_W, COL_LINE1);
         float iy = 52.0f;
-        ui_text_centred(0, SCREEN_BOT_W, iy,   0.50f, COL_WHITE,   "Scanning for QR code...");
+        ui_text_centred(0, SCREEN_BOT_W, iy,  0.50f, COL_WHITE,   "Scanning for QR code...");
         iy += 30.0f;
         ui_text(16.0f, iy, 0.50f, COL_LINE1, "Hold B");
-        ui_text(72.0f, iy, 0.50f, COL_WHITE,  "to cancel");
+        ui_text(80.0f, iy, 0.50f, COL_WHITE,  "to cancel");
         iy += 28.0f;
         ui_text_centred(0, SCREEN_BOT_W, iy, 0.42f, COL_DIMTEXT, "Auto-detected when in frame");
         ui_hline(0, SCREEN_H - 3.0f, SCREEN_BOT_W, COL_LINE2);
@@ -256,68 +378,42 @@ int qr_scan(char *out_buf, size_t out_len) {
         ui_frame_end();
 
         /*
-         * Downsample 400x240 -> 200x120 with 2x2 box average + BT.601 luma.
-         * Each output pixel averages the 4 source pixels at (2x, 2y),
-         * (2x+1, 2y), (2x, 2y+1), (2x+1, 2y+1).
-         * This doubles the effective module size for quirc's Otsu threshold.
+         * Decode: lock frame buffer once, build all three scales,
+         * apply adaptive threshold to each, then try quirc per scale.
          */
         svcWaitSynchronization(ctx->mutex, U64_MAX);
         const u16 *src = ctx->shared_buf;
-        for (int qy = 0; qy < QR_HEIGHT; qy++) {
-            for (int qx = 0; qx < QR_WIDTH; qx++) {
-                u32 sum = 0;
-                for (int dy = 0; dy < 2; dy++) {
-                    for (int dx = 0; dx < 2; dx++) {
-                        u16 px = src[(qy * 2 + dy) * CAM_WIDTH + (qx * 2 + dx)];
-                        u32 r8 = ((px >> 11) & 0x1F) << 3;
-                        u32 g8 = ((px >>  5) & 0x3F) << 2;
-                        u32 b8 =  (px        & 0x1F) << 3;
-                        sum += (r8 * 77 + g8 * 150 + b8 * 29) >> 8;
-                    }
-                }
-                s_grey_buf[qy * QR_WIDTH + qx] = (u8)(sum / 4);
-            }
-        }
+
+        box_avg_luma(src, CAM_WIDTH, s_grey4, W4, H4, SCALE_4);
+        box_avg_luma(src, CAM_WIDTH, s_grey3, W3, H3, SCALE_3);
+        box_avg_luma(src, CAM_WIDTH, s_grey2, W2, H2, SCALE_2);
+
         svcReleaseMutex(ctx->mutex);
 
-        int w = 0, h = 0;
-        uint8_t *qimg = quirc_begin(qrc, &w, &h);
-        memcpy(qimg, s_grey_buf, (size_t)w * h);
-        quirc_end(qrc);
+        /* Apply local adaptive threshold to each scale */
+        local_adaptive_threshold(s_grey4, W4, H4, 15, 10);
+        local_adaptive_threshold(s_grey3, W3, H3, 15, 10);
+        local_adaptive_threshold(s_grey2, W2, H2, 15, 10);
 
-        int n = quirc_count(qrc);
-        if (n > 0) LOG("qr_scan: frame %d -- %d code(s) detected", frames, n);
+        /* Try largest-downscale first (most px/module) */
+        if (try_decode(qrc4, s_grey4, W4, H4, frames, SCALE_4)) goto success;
+        if (try_decode(qrc3, s_grey3, W3, H3, frames, SCALE_3)) goto success;
+        if (try_decode(qrc2, s_grey2, W2, H2, frames, SCALE_2)) goto success;
 
-        for (int i = 0; i < n; i++) {
-            quirc_extract(qrc, i, &s_qr_code);
-
-            LOG("qr_scan: frame %d code %d size=%d (version %d)",
-                frames, i, s_qr_code.size, (s_qr_code.size - 17) / 4);
-
-            quirc_decode_error_t err = quirc_decode(&s_qr_code, &s_qr_data);
-            if (err == QUIRC_SUCCESS) goto success;
-
-            LOG("qr_scan: frame %d code %d normal decode error: %d", frames, i, (int)err);
-
-            quirc_flip(&s_qr_code);
-            err = quirc_decode(&s_qr_code, &s_qr_data);
-            if (err == QUIRC_SUCCESS) goto success;
-
-            LOG("qr_scan: frame %d code %d flipped decode error: %d", frames, i, (int)err);
-            continue;
+        frames++;
+        continue;
 
 success:
-            LOG("qr_scan: decoded on frame %d, len=%d", frames, s_qr_data.payload_len);
-            size_t len = s_qr_data.payload_len;
+        LOG("qr_scan: decoded on frame %d, len=%d", frames, s_qr_data.payload_len);
+        {
+            size_t len = (size_t)s_qr_data.payload_len;
             if (len >= out_len) len = out_len - 1;
             memcpy(out_buf, s_qr_data.payload, len);
             out_buf[len] = '\0';
-            result = QR_SUCCESS;
-            svcSignalEvent(ctx->cancel_event);
-            goto done;
         }
-
-        frames++;
+        result = QR_SUCCESS;
+        svcSignalEvent(ctx->cancel_event);
+        goto done;
     }
 
 done:
@@ -325,10 +421,12 @@ done:
     while (!ctx->finished)
         svcSleepThread(1000000);
 
-    if (cam_thread) threadJoin(cam_thread, U64_MAX);
+    threadJoin(cam_thread, U64_MAX);
 
     ui_cam_tex_free();
-    quirc_destroy(qrc);
+    quirc_destroy(qrc4);
+    quirc_destroy(qrc3);
+    quirc_destroy(qrc2);
     svcCloseHandle(ctx->cancel_event);
     svcCloseHandle(ctx->mutex);
     free(ctx->shared_buf);
