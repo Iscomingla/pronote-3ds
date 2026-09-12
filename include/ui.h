@@ -4,11 +4,11 @@
 
 // ---------------------------------------------------------------------------
 // Pronote colour palette
-// citro2d colours are 0xAABBGGRR (little-endian RGBA packed as u32)
+// C2D_Color32(r, g, b, a)
 // ---------------------------------------------------------------------------
 #define COL_BG       C2D_Color32(0x00, 0x86, 0x73, 0xFF)  // #008673 teal
-#define COL_LINE1    C2D_Color32(0x05, 0xCD, 0xFF, 0xFF)  // #FFCD05 gold
-#define COL_LINE2    C2D_Color32(0x80, 0xFF, 0xFF, 0xFF)  // #FFFF80 pale yellow
+#define COL_LINE1    C2D_Color32(0xFF, 0xCD, 0x05, 0xFF)  // #FFCD05 gold
+#define COL_LINE2    C2D_Color32(0xFF, 0xFF, 0x80, 0xFF)  // #FFFF80 pale yellow
 #define COL_WHITE    C2D_Color32(0xFF, 0xFF, 0xFF, 0xFF)
 #define COL_BLACK    C2D_Color32(0x00, 0x00, 0x00, 0xFF)
 #define COL_SELECTED C2D_Color32(0xFF, 0xFF, 0xFF, 0x30)  // translucent white highlight
