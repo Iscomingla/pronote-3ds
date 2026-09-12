@@ -13,9 +13,13 @@
  *                  fires — never while the previous DMA is in flight.
  *
  * Buffer layout:
- *   SIZE_CTR_TOP_LCD with OUTPUT_RGB_565 gives a plain row-major 400×240
- *   buffer. pixel (x, y) is at buf[y * CAM_WIDTH + x].
- *   (Confirmed against FBI source: qrBuf[y * w + x] = grey(px), no rotation.)
+ *   SIZE_CTR_TOP_LCD with OUTPUT_RGB_565 gives a plain row-major 400x240
+ *   buffer. pixel (x,y) is at buf[y * CAM_WIDTH + x].
+ *   However the outer camera outputs a horizontally mirrored image.
+ *   quirc finds the finder patterns but samples cells on the wrong side,
+ *   so quirc_decode returns QUIRC_ERROR_DATA_ECC (error 4) every time.
+ *   Fix: on ECC failure, call quirc_flip() and retry — this handles the
+ *   ISO 18004:2015 mirror case and is how FBI-NH resolves the same issue.
  *
  * Stack note: the following are declared static to avoid stack overflow:
  *   s_grey_buf   — 96000 bytes (400*240 grayscale)
@@ -266,7 +270,15 @@ int qr_scan(char *out_buf, size_t out_len) {
 
         for (int i = 0; i < n; i++) {
             quirc_extract(qrc, i, &s_qr_code);
+
+            // Try normal decode first
             quirc_decode_error_t err = quirc_decode(&s_qr_code, &s_qr_data);
+            if (err == QUIRC_ERROR_DATA_ECC) {
+                // Outer camera outputs a mirrored image; try flipped decode
+                quirc_flip(&s_qr_code);
+                err = quirc_decode(&s_qr_code, &s_qr_data);
+            }
+
             if (err == QUIRC_SUCCESS) {
                 LOG("qr_scan: decoded on frame %d, len=%d", frames, s_qr_data.payload_len);
                 size_t len = s_qr_data.payload_len;
@@ -277,7 +289,7 @@ int qr_scan(char *out_buf, size_t out_len) {
                 svcSignalEvent(ctx->cancel_event);
                 goto done;
             } else {
-                LOG("qr_scan: frame %d code %d decode error: %d", frames, i, (int)err);
+                LOG("qr_scan: frame %d code %d decode error after flip: %d", frames, i, (int)err);
             }
         }
 
