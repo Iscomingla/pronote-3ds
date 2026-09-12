@@ -4,7 +4,7 @@ Planned features, roughly in implementation order.
 
 ## 🔐 Authentication
 
-- [ ] **PIN decryption of jeton** — decrypt the jeton from the QR code using the 4-digit PIN (AES or XOR depending on Pronote's protocol)
+- [ ] **PIN decryption of jeton** — decrypt the jeton from the QR code using the 4-digit PIN (AES-CBC, key = MD5(pin), IV = all zeroes — see PRONOTE protocol)
 - [ ] **HTTP login request** — send decrypted credentials to the Pronote API endpoint
 - [ ] **Session persistence** — save session cookie to SD card so re-login isn't needed every time
 - [ ] **Secure credential storage** — encrypt saved credentials at rest
@@ -26,9 +26,9 @@ Planned features, roughly in implementation order.
 
 ## 🖥️ UI
 
-- [ ] **Switch to citro2d/citro3d** — replace the current console-based UI with a proper GPU-accelerated GUI (citro2d for 2D rendering, citro3d for lower-level GPU access); enables textures, sprites, smooth layouts, and camera preview via GPU texture upload
-- [ ] **Camera preview in QR scanner** — re-add blit_camera_to_fb + crosshair in qr_scan() after switching to citro2d/citro3d (removed for now due to display bugs with console-based gfx)
-- [ ] **Dual-screen layout** — login/nav on bottom screen, content on top
+- [x] **Switch to citro2d/citro3d** — `ui.c`/`ui.h` layer wrapping C2D/C3D; GPU-accelerated, dual-screen, system font
+- [ ] **Camera preview in QR scanner** — blit camera frames to a GPU texture + draw crosshair in `qr.c` (skipped for now; requires C3D texture upload while camera DMA is active)
+- [ ] **Dual-screen layout** — data on top screen, nav/controls on bottom (login screen already uses dual-screen)
 - [ ] **Scrollable output** — scroll through content longer than one screen
 - [ ] **Loading screen** — progress bar during network requests
 - [ ] **Status bar** — persistent connection/error status
