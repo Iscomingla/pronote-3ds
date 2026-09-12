@@ -73,13 +73,12 @@ static void draw_login_ui(void) {
         ui_rect(FIELD_X, y + FIELD_H * 0.25f, 3.0f, FIELD_H * 0.5f, COL_LINE1);
 }
 
+/* ---------------------------------------------------------------------------
+ * draw_login_screen
+ * --------------------------------------------------------------------------- */
 static void draw_login_screen(void) {
     ui_frame_begin();
 
-    /*
-     * C2D_TargetClear MUST come before C2D_SceneBegin (ui_target).
-     * Clear both targets upfront, then enter each scene to draw into it.
-     */
     ui_clear_target(ui_get_target(GFX_TOP),    COL_BG);
     ui_clear_target(ui_get_target(GFX_BOTTOM), COL_BG);
 
@@ -92,7 +91,7 @@ static void draw_login_screen(void) {
     ui_rect(0, STRIPE2_Y, SCREEN_TOP_W, STRIPE2_H, COL_LINE2);
 
     float fy = CONTENT_Y;
-    char lbl[80];
+    char  lbl[80];
 
     snprintf(lbl, sizeof(lbl), "Username%s",
              app.current_field == 0 ? "  [A: edit]" : "");
@@ -101,7 +100,8 @@ static void draw_login_screen(void) {
 
     snprintf(lbl, sizeof(lbl), "Pronote QR%s",
              app.current_field == 1 ? "  [A: scan]" : "");
-    const char *qr_val = strlen(app.jeton) > 0 ? "Scanned \xe2\x9c\x93" : "Not scanned";
+    const char *qr_val = strlen(app.jeton) > 0
+                         ? "Scanned \xe2\x9c\x93" : "Not scanned";
     draw_field(fy, lbl, qr_val, 0, app.current_field == 1);
     fy += FIELD_H + FIELD_GAP;
 
@@ -109,7 +109,8 @@ static void draw_login_screen(void) {
              app.current_field == 2 ? "  [A: enter]" : "");
     draw_field(fy, lbl, app.pin, 1, app.current_field == 2);
 
-    ui_rect(0, STATUS_Y, SCREEN_TOP_W, STATUS_H, C2D_Color32(0x00, 0x50, 0x40, 0xCC));
+    ui_rect(0, STATUS_Y, SCREEN_TOP_W, STATUS_H,
+            C2D_Color32(0x00, 0x50, 0x40, 0xCC));
     ui_hline(0, STATUS_Y, SCREEN_TOP_W, COL_LINE2);
     ui_text(8.0f, STATUS_Y + 2.0f, 0.45f, COL_WHITE, app.status_message);
 
@@ -124,11 +125,11 @@ static void draw_login_screen(void) {
     float lsz = 0.50f;
     float lg  = 18.0f;
     const char *keys[] = { "\xe2\x86\x91\xe2\x86\x93", "A", "Y", "X", "START" };
-    const char *desc[] = { "Navigate fields", "Edit / Scan QR",
-                           "Clear field", "Login", "Exit" };
+    const char *descs[] = { "Navigate fields", "Edit / Scan QR",
+                            "Clear field", "Login", "Exit" };
     for (int i = 0; i < 5; i++) {
         ui_text(12.0f, cy, lsz, COL_LINE1, keys[i]);
-        ui_text(44.0f, cy, lsz, COL_WHITE, desc[i]);
+        ui_text(44.0f, cy, lsz, COL_WHITE, descs[i]);
         cy += lg;
     }
     ui_hline(0, SCREEN_H - 3.0f, SCREEN_BOT_W, COL_LINE2);
@@ -156,8 +157,6 @@ static void open_keyboard_for_field(void) {
         /* PIN */
         swkbdInit(&swkbd, SWKBD_TYPE_NUMPAD, 1, 4);
         swkbdSetPasswordMode(&swkbd, SWKBD_PASSWORD_HIDE_DELAY);
-        swkbdSetValidation(&swkbd, SWKBD_ANYTHING, 0, 0);
-        swkbdSetFeatures(&swkbd, SWKBD_FIXED_WIDTH);
         swkbdSetHintText(&swkbd, "Enter 4-digit PIN");
         safe_strncpy(tmp, app_state.pin, sizeof(tmp));
     }
@@ -178,15 +177,12 @@ static void open_keyboard_for_field(void) {
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * main
+ * --------------------------------------------------------------------------- */
 int main(int argc, char *argv[]) {
     (void)argc; (void)argv;
 
-    /*
-     * gfxInitDefault() brings up the LCD and GSP service — required first.
-     * C3D_Init() (inside ui_init()) then takes over the GPU command pipe
-     * on top of that. Both are needed; gfxExit() cleans up on exit.
-     * Every official citro2d/citro3d example follows this same order.
-     */
     gfxInitDefault();
     ui_init();
 
