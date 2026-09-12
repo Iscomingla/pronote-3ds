@@ -5,8 +5,13 @@
 #include "network.h"
 #include "qr.h"
 
+/*
+ * The jeton is a hex-encoded AES-CBC ciphertext.
+ * The Pronote protocol imposes no documented upper bound on its length.
+ * 512 chars gives us comfortable headroom beyond any observed real-world value.
+ */
 #define MAX_USERNAME_LEN  64
-#define MAX_JETON_LEN    225   /* 224 usable chars + null */
+#define MAX_JETON_LEN    513   /* 512 usable chars + null */
 #define MAX_PIN            5   /* 4 digits + null */
 
 typedef enum {
