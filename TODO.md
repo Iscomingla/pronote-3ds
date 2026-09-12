@@ -27,7 +27,7 @@ Planned features, roughly in implementation order.
 ## 🖥️ UI
 
 - [x] **Switch to citro2d/citro3d** — `ui.c`/`ui.h` layer wrapping C2D/C3D; GPU-accelerated, dual-screen, system font
-- [ ] **Camera preview in QR scanner** — blit camera frames to a GPU texture + draw crosshair in `qr.c` (skipped for now; requires C3D texture upload while camera DMA is active)
+- [x] **Camera preview in QR scanner** — FBI-NH thread model; live RGB565 preview via Morton-encoded GPU texture; gold crosshair overlay
 - [ ] **Dual-screen layout** — data on top screen, nav/controls on bottom (login screen already uses dual-screen)
 - [ ] **Scrollable output** — scroll through content longer than one screen
 - [ ] **Loading screen** — progress bar during network requests
