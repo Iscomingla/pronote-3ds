@@ -40,13 +40,14 @@ Produces `pronote-3ds.3dsx`. Copy it to `/3ds/pronote-3ds.3dsx` on your SD card 
 
 ### QR code format
 
-The app expects the Pronote QR payload to be JSON:
+The Pronote QR payload is JSON:
 
 ```json
-{"login":"username","jeton":"<up to 224 chars>"}
+{"login":"<hex string>","jeton":"<hex string>","url":"..."}
 ```
 
-The jeton field supports up to **224 characters** (Pronote's maximum).
+Both `login` and `jeton` are AES-CBC hex-encoded ciphertexts (decrypted with your 4-digit PIN).
+The Pronote protocol defines no maximum length for either field; the app allocates 512 chars for the jeton, which is well beyond any observed real-world value.
 
 ## Project structure
 
