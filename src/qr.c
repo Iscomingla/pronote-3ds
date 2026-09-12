@@ -12,24 +12,15 @@
  *                  so CAMU_SetReceiving is only re-armed after the recv event
  *                  fires — never while the previous DMA is in flight.
  *
- * Because citro3d and the camera sysmodule run in separate threads sharing
- * different hardware resources (GPU vs camera DMA), there is no GSP conflict
- * and no need for ui_suspend/ui_resume.
- *
- * Buffer layout note:
- *   SIZE_CTR_TOP_LCD with OUTPUT_RGB_565 gives a 400×240 buffer, BUT the
- *   camera hardware outputs it column-major (rotated 90° CCW relative to the
- *   physical scene). Pixel at screen position (x, y) is stored at:
- *     buf[x * CAM_HEIGHT + (CAM_HEIGHT - 1 - y)]
- *   We un-rotate into s_grey_buf before handing to quirc so that the QR code
- *   is axis-aligned. Without this, quirc finds the three finder squares but
- *   the perspective matrix is wrong and quirc_decode always returns an error.
+ * Buffer layout:
+ *   SIZE_CTR_TOP_LCD with OUTPUT_RGB_565 gives a plain row-major 400×240
+ *   buffer. pixel (x, y) is at buf[y * CAM_WIDTH + x].
+ *   (Confirmed against FBI source: qrBuf[y * w + x] = grey(px), no rotation.)
  *
  * Stack note: the following are declared static to avoid stack overflow:
  *   s_grey_buf   — 96000 bytes (400*240 grayscale)
  *   s_qr_code    — ~3940 bytes (quirc_code with cell_bitmap[3929])
  *   s_qr_data    — ~8910 bytes (quirc_data with payload[8896])
- * All three are only ever accessed from the main-thread side of qr_scan.
  */
 
 #include <3ds.h>
@@ -45,7 +36,6 @@
 #define CAM_HEIGHT  240
 #define CAM_BUF_SZ  (CAM_WIDTH * CAM_HEIGHT * sizeof(u16))
 
-// Events passed to svcWaitSynchronizationN
 #define EV_CANCEL  0
 #define EV_RECV    1
 #define EV_BUFERR  2
@@ -163,34 +153,11 @@ cleanup_linear:
 }
 
 // ---------------------------------------------------------------------------
-// Static buffers — must not be on the stack (sizes below):
-//   s_grey_buf : 96 000 bytes
-//   s_qr_code  :  ~3 940 bytes
-//   s_qr_data  :  ~8 910 bytes
+// Static buffers — keep off the stack
 // ---------------------------------------------------------------------------
 static u8                s_grey_buf[CAM_WIDTH * CAM_HEIGHT];
 static struct quirc_code s_qr_code;
 static struct quirc_data s_qr_data;
-
-// ---------------------------------------------------------------------------
-// rgb565_to_grey_unrotate
-//
-// The 3DS camera outputs SIZE_CTR_TOP_LCD frames column-major (90° CCW).
-// Physical scene pixel (sx, sy) is stored at src[sx * CAM_HEIGHT + (CAM_HEIGHT-1-sy)].
-// We want dst[sy * CAM_WIDTH + sx] = grey(src[sx * CAM_HEIGHT + (CAM_HEIGHT-1-sy)]).
-// Result: a normal row-major 400×240 greyscale image suitable for quirc.
-// ---------------------------------------------------------------------------
-static void rgb565_to_grey_unrotate(const u16 *src, u8 *dst) {
-    for (int sx = 0; sx < CAM_WIDTH; sx++) {
-        for (int sy = 0; sy < CAM_HEIGHT; sy++) {
-            u16 px = src[sx * CAM_HEIGHT + (CAM_HEIGHT - 1 - sy)];
-            u8  r  = (px >> 11) & 0x1F;
-            u8  g  = (px >>  5) & 0x3F;
-            u8  b  =  px        & 0x1F;
-            dst[sy * CAM_WIDTH + sx] = (u8)((r * 8 + g * 4 + b * 8) / 3);
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // qr_scan
@@ -277,9 +244,16 @@ int qr_scan(char *out_buf, size_t out_len) {
 
         ui_frame_end();
 
-        // Un-rotate camera buffer and feed to quirc
+        // RGB565 -> greyscale, plain row-major (same as FBI)
         svcWaitSynchronization(ctx->mutex, U64_MAX);
-        rgb565_to_grey_unrotate(ctx->shared_buf, s_grey_buf);
+        const u16 *src = ctx->shared_buf;
+        for (int i = 0; i < CAM_WIDTH * CAM_HEIGHT; i++) {
+            u16 px = src[i];
+            s_grey_buf[i] = (u8)(
+                ((((px >> 11) & 0x1F) << 3) +
+                 (((px >>  5) & 0x3F) << 2) +
+                  ((px        & 0x1F) << 3)) / 3);
+        }
         svcReleaseMutex(ctx->mutex);
 
         int w = 0, h = 0;
