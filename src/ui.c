@@ -1,6 +1,12 @@
 /*
- * ui.c — citro2d UI layer for notApro
+ * ui.c -- citro2d UI layer for notApro
  *
+ * C2D_TargetClear must come before C2D_SceneBegin.
+ * Use the pattern:
+ *   ui_clear_target(ui_get_target(GFX_TOP),    COL_BG);
+ *   ui_clear_target(ui_get_target(GFX_BOTTOM), COL_BG);
+ *   ui_target(GFX_TOP);    // draw ...
+ *   ui_target(GFX_BOTTOM); // draw ...
  * Design notes:
  *   - C2D_FontLoadSystem(CFG_REGION_EUR) is called once and cached.
  *     EUR covers the full Latin charset and works on all 3DS regions.
@@ -17,11 +23,7 @@
 
 #include "ui.h"
 #include <string.h>
-#include <stdio.h>
 
-/* -------------------------------------------------------------------------
- * Internal state
- * ---------------------------------------------------------------------- */
 static C3D_RenderTarget *s_top  = NULL;
 static C3D_RenderTarget *s_bot  = NULL;
 static C3D_RenderTarget *s_cur  = NULL;
@@ -29,9 +31,6 @@ static C3D_RenderTarget *s_cur  = NULL;
 static C2D_TextBuf s_tbuf;
 static C2D_Font    s_font = NULL;   /* system font, or NULL = built-in default */
 
-/* -------------------------------------------------------------------------
- * Lifecycle
- * ---------------------------------------------------------------------- */
 void ui_init(void) {
     C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
     C2D_Init(C2D_DEFAULT_MAX_OBJECTS);
@@ -41,7 +40,6 @@ void ui_init(void) {
     s_bot = C2D_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT);
     s_cur = s_top;
 
-    /* 1024 glyphs is plenty for all strings in a single login frame */
     s_tbuf = C2D_TextBufNew(1024);
 
     /*
@@ -63,9 +61,6 @@ void ui_exit(void) {
     C3D_Fini();
 }
 
-/* -------------------------------------------------------------------------
- * Frame
- * ---------------------------------------------------------------------- */
 void ui_frame_begin(void) {
     C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
     C2D_TextBufClear(s_tbuf);
@@ -73,6 +68,10 @@ void ui_frame_begin(void) {
 
 void ui_frame_end(void) {
     C3D_FrameEnd(0);
+}
+
+C3D_RenderTarget *ui_get_target(gfxScreen_t screen) {
+    return (screen == GFX_TOP) ? s_top : s_bot;
 }
 
 /* -------------------------------------------------------------------------
@@ -125,7 +124,7 @@ void ui_hline(float x, float y, float len, u32 colour) {
 void ui_text(float x, float y, float size, u32 colour, const char *str) {
     if (!str || !*str) return;
     C2D_Text t;
-    C2D_TextFontParse(&t, s_font, s_tbuf, str);  /* s_font==NULL → built-in */
+    C2D_TextFontParse(&t, s_font, s_tbuf, str);  /* s_font==NULL -> built-in */
     C2D_TextOptimize(&t);
     C2D_DrawText(&t, C2D_WithColor, x, y, 0.5f, size, size, colour);
 }

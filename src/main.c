@@ -119,7 +119,7 @@ static void draw_login_screen(void) {
     ui_hline(0, STATUS_Y, SCREEN_TOP_W, COL_LINE2);
     ui_text(8.0f, STATUS_Y + 2.0f, 0.45f, COL_WHITE, app.status_message);
 
-    /* ---- BOTTOM SCREEN — controls ---- */
+    /* ---- BOTTOM SCREEN ---- */
     ui_target(GFX_BOTTOM);
 
     ui_rect(0, 0, SCREEN_BOT_W, HEADER_H, C2D_Color32(0x00, 0x60, 0x52, 0xFF));
