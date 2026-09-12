@@ -1,72 +1,71 @@
 # notApro — Pronote on 3DS
 
-A Nintendo 3DS homebrew app to access Pronote (French school management system) using QR code authentication.
-
-> **Status:** QR scanning and PIN entry work. Actual login (PIN decryption + HTTP request) is not yet implemented — see [TODO.md](TODO.md).
+A Nintendo 3DS homebrew app to authenticate with Pronote using a QR code jeton + 4-digit PIN.
 
 ## Requirements
 
-- **devkitPro** with devkitARM: https://devkitpro.org/wiki/Getting_Started
+- **devkitPro** with devkitARM — https://devkitpro.org/wiki/Getting_Started
 - **libctru** (included with devkitPro)
-- **quirc** (bundled in `lib/quirc/`)
 
-```bash
-# Required devkitPro packages
-pacman -S devkitARM 3ds-dev
-```
+No extra pacman packages needed. quirc is vendored under `lib/quirc/`.
 
 ## Build
 
 ```bash
-make        # Build .3dsx
-make clean  # Clean build artifacts
+make clean && make
 ```
 
-Output: `notApro.3dsx`
-
-## Install on 3DS
-
-Copy `notApro.3dsx` to your SD card:
-```
-/3ds/notApro.3dsx
-```
-Launch from Homebrew Launcher.
+Produces `pronote-3ds.3dsx`. Copy it to `/3ds/pronote-3ds.3dsx` on your SD card and launch via Homebrew Launcher.
 
 ## Usage
 
-### How Pronote QR Login Works
+### Login flow
 
-1. **Generate QR code** in your Pronote app (mobile or web) — Settings → QR Login
-2. **Scan it** with the 3DS camera inside notApro
-3. The QR contains your encrypted `login` and `jeton` fields
-4. **Enter the 4-digit PIN** shown alongside the QR code to decrypt your credentials
-5. Press **X** to connect
+1. Press **R** to open the QR scanner
+2. Point the **outer camera** at your Pronote QR code
+3. Username and jeton are filled automatically
+4. Navigate to **PIN Code** and press **A** to enter your 4-digit PIN
+5. Press **X** to login
 
 ### Controls
 
 | Button | Action |
 |--------|--------|
-| **UP/DOWN** | Navigate between fields |
-| **A** | Edit field / Open camera to scan QR |
-| **B** (in scanner) | Cancel scan |
-| **Y** | Clear field |
-| **X** | Login |
-| **START** | Exit |
+| UP / DOWN | Navigate fields |
+| A | Edit field / Scan QR (on jeton field) |
+| Y | Clear field |
+| R | Open QR scanner |
+| X | Login |
+| START | Exit |
 
-### Fields
+### QR code format
 
-- **Username** — pre-filled automatically after QR scan
-- **Jeton** — scanned from QR code (up to 255 chars, no manual entry needed)
-- **PIN Code** — 4-digit code shown alongside the QR code
+The Pronote QR payload is JSON:
 
-## Technical Details
+```json
+{"login":"<hex string>","jeton":"<hex string>","url":"..."}
+```
 
-- Uses **libctru** for graphics, input, and camera
-- Uses **quirc** (`lib/quirc/`) for QR code decoding from camera frames
-- Camera captures at 400×240 in YUV422; Y channel extracted for quirc
-- Pronote QR codes contain a JSON payload: `{"login":"...","jeton":"...","url":"..."}`
-- PIN decryption and HTTP login are not yet implemented — see [TODO.md](TODO.md)
+Both `login` and `jeton` are AES-CBC hex-encoded ciphertexts (decrypted with your 4-digit PIN).
+The Pronote protocol defines no maximum length for either field; the app allocates 512 chars for the jeton, which is well beyond any observed real-world value.
 
-## License
+## Project structure
 
-MIT — not affiliated with Index-Education or Pronote.
+```
+src/
+  main.c      — UI and input loop
+  qr.c        — Camera capture + quirc QR decoder
+  network.c   — HTTP stub (WIP)
+include/
+  qr.h
+  network.h
+lib/quirc/    — Vendored quirc QR library
+```
+
+## Building a CIA
+
+See `ADVANCED.md` for CIA packaging instructions.
+
+## Disclaimer
+
+Not affiliated with Index-Education or Pronote. Use at your own risk and follow your school's policies.

@@ -6,9 +6,14 @@
 #include "network.h"
 #include "qr.h"
 
+/*
+ * The jeton is a hex-encoded AES-CBC ciphertext.
+ * The Pronote protocol imposes no documented upper bound on its length.
+ * 512 chars gives us comfortable headroom beyond any observed real-world value.
+ */
 #define MAX_USERNAME_LEN  64
-#define MAX_JETON_LEN    513
-#define MAX_PIN            5
+#define MAX_JETON_LEN    513   /* 512 usable chars + null */
+#define MAX_PIN            5   /* 4 digits + null */
 
 typedef enum {
     SCREEN_LOGIN,
@@ -16,14 +21,14 @@ typedef enum {
 } Screen;
 
 typedef struct {
-    char   username[MAX_USERNAME_LEN];
-    char   jeton[MAX_JETON_LEN];
-    char   pin[MAX_PIN];
-    char   uuid[37];
-    int    current_field;
-    int    logged_in;
-    char   status_message[128];
-    int    needs_redraw;
+    char username[MAX_USERNAME_LEN];
+    char jeton[MAX_JETON_LEN];
+    char pin[MAX_PIN];
+    char uuid[37];
+    int  current_field;  /* 0: username, 1: jeton (QR), 2: pin */
+    int  logged_in;
+    char status_message[128];
+    int  needs_redraw;
     Screen screen;
 } AppState;
 
@@ -37,40 +42,29 @@ static void safe_strncpy(char *dest, const char *src, size_t maxlen) {
     dest[len] = '\0';
 }
 
-#define HEADER_H   36.0f
-#define STRIPE1_Y  (HEADER_H)
-#define STRIPE1_H   4.0f
-#define STRIPE2_Y  (STRIPE1_Y + STRIPE1_H)
-#define STRIPE2_H   2.0f
-#define CONTENT_Y  (STRIPE2_Y + STRIPE2_H + 12.0f)
-#define FIELD_H    34.0f
-#define FIELD_GAP   8.0f
-#define FIELD_X    16.0f
-#define FIELD_W    (SCREEN_TOP_W - FIELD_X * 2.0f)
-#define STATUS_H   18.0f
-#define STATUS_Y   (SCREEN_H - STATUS_H)
+static void draw_login_ui(void) {
+    consoleClear();
+    printf("\x1b[2;0H");
+    printf("=== PRONOTE 3DS LOGIN ===\n\n");
 
-static void draw_field(float y, const char *label,
-                       const char *value, int is_masked, int selected) {
-    u32 bg   = selected ? COL_SELECTED : C2D_Color32(0x00, 0x00, 0x00, 0x28);
-    u32 bord = selected ? COL_LINE1    : COL_LINE2;
+    /* Username */
+    printf(app_state.current_field == 0 ? "> " : "  ");
+    printf("Username: [%s]\n", app_state.username);
+    printf("  (from QR code)\n\n");
 
-    ui_rect(FIELD_X, y, FIELD_W, FIELD_H, bg);
-    ui_hline(FIELD_X, y + FIELD_H - 1.0f, FIELD_W, bord);
-    ui_text(FIELD_X + 8.0f, y + 4.0f,  0.45f, COL_DIMTEXT, label);
+    /* Jeton */
+    printf(app_state.current_field == 1 ? "> " : "  ");
+    printf("Jeton:    [%s]\n",
+           strlen(app_state.jeton) > 0 ? "OK" : "NOT SCANNED");
+    printf("  (scan QR code)\n\n");
 
-    char display[128] = {0};
-    if (is_masked && strlen(value) > 0) {
-        for (int i = 0; i < (int)strlen(value) && i < 4; i++)
-            display[i] = '*';
-    } else if (strlen(value) == 0) {
-        safe_strncpy(display, "\xe2\x80\x94", sizeof(display));
-    } else if (strlen(value) > 24) {
-        memcpy(display, value, 21);
-        strcat(display, "...");
-    } else {
-        safe_strncpy(display, value, sizeof(display));
-    }
+    /* PIN */
+    printf(app_state.current_field == 2 ? "> " : "  ");
+    printf("PIN Code: [");
+    for (int i = 0; i < (int)strlen(app_state.pin); i++) printf("*");
+    printf("]\n");
+    if (app_state.current_field == 2)
+        printf("  (4 digits)\n");
 
     u32 val_col = strlen(value) == 0 ? COL_DIMTEXT : COL_WHITE;
     ui_text(FIELD_X + 8.0f, y + 16.0f, 0.55f, val_col, display);
@@ -143,38 +137,44 @@ static void draw_login_screen(void) {
     ui_frame_end();
 }
 
-static void open_keyboard(void) {
-    if (app.current_field == 1) {
-        app.screen = SCREEN_QR_SCAN;
+/* Open swkbd for the current field, pre-filled with its existing value. */
+static void open_keyboard_for_field(void) {
+    if (app_state.current_field == 1) {
+        /* Jeton field — trigger QR scan */
+        app_state.screen = SCREEN_QR_SCAN;
         return;
     }
 
     SwkbdState swkbd;
     char tmp[512] = {0};
 
-    if (app.current_field == 0) {
+    if (app_state.current_field == 0) {
         swkbdInit(&swkbd, SWKBD_TYPE_NORMAL, 2, MAX_USERNAME_LEN - 1);
         swkbdSetHintText(&swkbd, "Enter username from QR code");
-        safe_strncpy(tmp, app.username, sizeof(tmp));
+        safe_strncpy(tmp, app_state.username, sizeof(tmp));
     } else {
+        /* PIN */
         swkbdInit(&swkbd, SWKBD_TYPE_NUMPAD, 1, 4);
         swkbdSetPasswordMode(&swkbd, SWKBD_PASSWORD_HIDE_DELAY);
         swkbdSetValidation(&swkbd, SWKBD_ANYTHING, 0, 0);
         swkbdSetFeatures(&swkbd, SWKBD_FIXED_WIDTH);
         swkbdSetHintText(&swkbd, "Enter 4-digit PIN");
-        safe_strncpy(tmp, app.pin, sizeof(tmp));
+        safe_strncpy(tmp, app_state.pin, sizeof(tmp));
     }
 
+    /* Pre-fill keyboard with existing content if any */
     if (tmp[0] != '\0')
         swkbdSetInitialText(&swkbd, tmp);
 
     memset(tmp, 0, sizeof(tmp));
-    if (swkbdInputText(&swkbd, tmp, sizeof(tmp)) == SWKBD_BUTTON_CONFIRM) {
-        if (app.current_field == 0)
-            safe_strncpy(app.username, tmp, sizeof(app.username));
+    SwkbdButton btn = swkbdInputText(&swkbd, tmp, sizeof(tmp));
+
+    if (btn == SWKBD_BUTTON_CONFIRM) {
+        if (app_state.current_field == 0)
+            safe_strncpy(app_state.username, tmp, sizeof(app_state.username));
         else
-            safe_strncpy(app.pin, tmp, sizeof(app.pin));
-        app.needs_redraw = 1;
+            safe_strncpy(app_state.pin, tmp, sizeof(app_state.pin));
+        app_state.needs_redraw = 1;
     }
 }
 
@@ -198,37 +198,39 @@ int main(int argc, char *argv[]) {
     app.needs_redraw = 1;
 
     while (aptMainLoop()) {
-
-        if (app.screen == SCREEN_QR_SCAN) {
+        if (app_state.screen == SCREEN_QR_SCAN) {
             char qr_result[MAX_JETON_LEN + MAX_USERNAME_LEN + 64] = {0};
-            int  rc = qr_scan(qr_result, sizeof(qr_result));
 
-            if (rc == QR_SUCCESS) {
-                char *lp = strstr(qr_result, "\"login\":");
-                char *jp = strstr(qr_result, "\"jeton\":");
-                if (lp && jp) {
-                    lp += 9;
-                    char *e = strchr(lp, '"');
-                    if (e) {
-                        size_t n = (size_t)(e - lp);
-                        if (n >= MAX_USERNAME_LEN) n = MAX_USERNAME_LEN - 1;
-                        memcpy(app.username, lp, n);
-                        app.username[n] = '\0';
+            int scan_result = qr_scan(qr_result, sizeof(qr_result));
+
+            if (scan_result == QR_SUCCESS) {
+                /* Parse JSON: {"login":"...","jeton":"..."} */
+                char *login_ptr = strstr(qr_result, "\"login\":");
+                char *jeton_ptr = strstr(qr_result, "\"jeton\":");
+
+                if (login_ptr && jeton_ptr) {
+                    login_ptr += 9; /* skip "login":" */
+                    char *end = strchr(login_ptr, '"');
+                    if (end) {
+                        size_t len = (size_t)(end - login_ptr);
+                        if (len >= MAX_USERNAME_LEN) len = MAX_USERNAME_LEN - 1;
+                        memcpy(app_state.username, login_ptr, len);
+                        app_state.username[len] = '\0';
                     }
-                    jp += 9;
-                    e = strchr(jp, '"');
-                    if (e) {
-                        size_t n = (size_t)(e - jp);
-                        if (n >= MAX_JETON_LEN) n = MAX_JETON_LEN - 1;
-                        memcpy(app.jeton, jp, n);
-                        app.jeton[n] = '\0';
+
+                    jeton_ptr += 9; /* skip "jeton":" */
+                    end = strchr(jeton_ptr, '"');
+                    if (end) {
+                        size_t len = (size_t)(end - jeton_ptr);
+                        if (len >= MAX_JETON_LEN) len = MAX_JETON_LEN - 1;
+                        memcpy(app_state.jeton, jeton_ptr, len);
+                        app_state.jeton[len] = '\0';
                     }
-                    safe_strncpy(app.status_message, "QR scanned! Enter your PIN.",
-                                 sizeof(app.status_message));
-                    app.current_field = 2;
+
+                    safe_strncpy(app_state.status_message, "QR scanned! Enter PIN", sizeof(app_state.status_message));
+                    app_state.current_field = 2;
                 } else {
-                    safe_strncpy(app.status_message, "Invalid QR format.",
-                                 sizeof(app.status_message));
+                    safe_strncpy(app_state.status_message, "Invalid QR format", sizeof(app_state.status_message));
                 }
             } else if (rc == QR_CANCELLED) {
                 safe_strncpy(app.status_message, "Scan cancelled.",
@@ -243,6 +245,7 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
+        /* LOGIN screen */
         hidScanInput();
         u32 kdown = hidKeysDown();
 
@@ -261,10 +264,10 @@ int main(int argc, char *argv[]) {
             app.needs_redraw = 1;
         }
         if (kdown & KEY_Y) {
-            if      (app.current_field == 0) memset(app.username, 0, sizeof(app.username));
-            else if (app.current_field == 1) memset(app.jeton,    0, sizeof(app.jeton));
-            else                             memset(app.pin,       0, sizeof(app.pin));
-            app.needs_redraw = 1;
+            if      (app_state.current_field == 0) memset(app_state.username, 0, sizeof(app_state.username));
+            else if (app_state.current_field == 1) memset(app_state.jeton,    0, sizeof(app_state.jeton));
+            else                                   memset(app_state.pin,       0, sizeof(app_state.pin));
+            app_state.needs_redraw = 1;
         }
         if (kdown & KEY_X) {
             if (strlen(app.username) == 0)
