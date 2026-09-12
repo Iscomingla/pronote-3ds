@@ -1,7 +1,7 @@
 /*
  * qr.c -- QR code scanner: 3DS outer camera + quirc.
  *
- * Two hardware requirements on real 3DS:
+ * Hardware requirements on real 3DS:
  *
  * 1. GSP conflict: citro3d holds a GSP session the camera sysmodule cannot
  *    share. ui_suspend() tears down C3D/C2D before camInit(); ui_resume()
@@ -10,6 +10,18 @@
  * 2. Linear heap: the camera DMA engine can only write to physical linear
  *    memory. calloc/malloc give standard heap — unusable for DMA on hardware.
  *    cam_buf must be allocated with linearAlloc() and freed with linearFree().
+ *
+ * 3. Re-arm discipline: CAMU_SetReceiving must NEVER be called while the
+ *    previous transfer is still in flight. The previous attempt used
+ *    RESET_STICKY + svcClearEvent and immediately re-armed, which let the
+ *    loop call CAMU_SetReceiving while the sysmodule was still processing the
+ *    prior DMA, causing a prefetch abort / kernel panic in the camera process
+ *    a few seconds in.
+ *
+ *    Fix: use RESET_ONESHOT events, close and re-create the handle each frame.
+ *    RESET_ONESHOT is automatically cleared by svcWaitSynchronization, so by
+ *    the time we return from the wait the transfer is fully done and it is
+ *    safe to re-arm for the next frame.
  */
 
 #include <3ds.h>
@@ -22,7 +34,7 @@
 #define CAM_WIDTH        400
 #define CAM_HEIGHT       240
 #define CAM_BUF_SZ       (CAM_WIDTH * CAM_HEIGHT * sizeof(u16))
-#define RECV_TIMEOUT_NS  2000000000LL
+#define RECV_TIMEOUT_NS  400000000LL   // 400 ms — one frame at 30 fps + margin
 
 static void draw_qr_screen(void) {
     ui_frame_begin();
@@ -32,7 +44,7 @@ static void draw_qr_screen(void) {
 
     ui_target(GFX_TOP);
     ui_rect(0, 0, SCREEN_TOP_W, 36.0f, C2D_Color32(0x00, 0x60, 0x52, 0xFF));
-    ui_text_centred(0, SCREEN_TOP_W, 8.0f,   0.65f, COL_WHITE, "notApro");
+    ui_text_centred(0, SCREEN_TOP_W, 8.0f,   0.65f, COL_WHITE,   "notApro");
     ui_rect(0, 36.0f, SCREEN_TOP_W, 4.0f, COL_LINE1);
     ui_rect(0, 40.0f, SCREEN_TOP_W, 2.0f, COL_LINE2);
     ui_text_centred(0, SCREEN_TOP_W, 110.0f, 0.55f, COL_LINE2,
@@ -49,7 +61,7 @@ static void draw_qr_screen(void) {
     ui_text_centred(0, SCREEN_BOT_W, 8.0f, 0.65f, COL_WHITE, "QR Scanner");
     ui_hline(0, 36.0f, SCREEN_BOT_W, COL_LINE1);
     float cy = 52.0f;
-    ui_text_centred(0, SCREEN_BOT_W, cy,   0.50f, COL_WHITE,   "Scanning for QR code...");
+    ui_text_centred(0, SCREEN_BOT_W, cy,   0.50f, COL_WHITE,  "Scanning for QR code...");
     cy += 30.0f;
     ui_text(16.0f, cy, 0.50f, COL_LINE1, "B");
     ui_text(36.0f, cy, 0.50f, COL_WHITE, "Cancel");
@@ -109,26 +121,41 @@ int qr_scan(char *out_buf, size_t out_len) {
     CAMU_SetTrimming(PORT_CAM1, false);
     CAMU_SetTransferBytes(PORT_CAM1, transferUnit, CAM_WIDTH, CAM_HEIGHT);
 
-    Handle recv_event = 0;
-    svcCreateEvent(&recv_event, RESET_STICKY);
     CAMU_ClearBuffer(PORT_CAM1);
-    CAMU_SetReceiving(&recv_event, cam_buf, PORT_CAM1, CAM_BUF_SZ, (s16)transferUnit);
     CAMU_StartCapture(PORT_CAM1);
 
-    /* 6. Capture loop */
+    /* 6. Capture loop
+     *
+     * Key discipline: create a fresh RESET_ONESHOT event every iteration.
+     * svcWaitSynchronization on a RESET_ONESHOT atomically clears it when it
+     * returns, so the transfer is guaranteed complete before we touch cam_buf
+     * or call CAMU_SetReceiving again. No svcClearEvent needed.
+     *
+     * We also flush the CPU cache before arming so the DMA engine sees a clean
+     * buffer, then invalidate after the wait so the CPU sees fresh pixel data.
+     */
     int result = QR_CANCELLED;
 
     while (aptMainLoop()) {
         hidScanInput();
         if (hidKeysDown() & KEY_B) break;
 
-        res = svcWaitSynchronization(recv_event, RECV_TIMEOUT_NS);
-        if (R_FAILED(res)) continue;
-        svcClearEvent(recv_event);
-        GSPGPU_InvalidateDataCache(cam_buf, CAM_BUF_SZ);
+        /* Arm: flush cache -> create event -> SetReceiving -> wait -> invalidate */
+        GSPGPU_FlushDataCache(cam_buf, CAM_BUF_SZ);
+
+        Handle recv_event = 0;
+        svcCreateEvent(&recv_event, RESET_ONESHOT);
 
         CAMU_SetReceiving(&recv_event, cam_buf, PORT_CAM1, CAM_BUF_SZ, (s16)transferUnit);
 
+        res = svcWaitSynchronization(recv_event, RECV_TIMEOUT_NS);
+        svcCloseHandle(recv_event);   // always close, whether we timed out or not
+
+        if (R_FAILED(res)) continue;  // timeout — just try next frame
+
+        GSPGPU_InvalidateDataCache(cam_buf, CAM_BUF_SZ);
+
+        /* Feed grayscale to quirc */
         int w = 0, h = 0;
         uint8_t *img = quirc_begin(qrc, &w, &h);
         for (int y = 0; y < h; y++) {
@@ -161,7 +188,6 @@ int qr_scan(char *out_buf, size_t out_len) {
 done:
     CAMU_StopCapture(PORT_CAM1);
     CAMU_Activate(SELECT_NONE);
-    svcCloseHandle(recv_event);
     linearFree(cam_buf);
     camExit();
     quirc_destroy(qrc);
