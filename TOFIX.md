@@ -4,18 +4,21 @@
 
 **Branch:** `feat/citro2d-ui-step1`
 
-**Symptom:** Prefetch abort / kernel panic in `camera` process (`0004013000001602`) immediately when QR scanning is triggered. Happens on both the old and current code.
+**Symptom:** Prefetch abort / kernel panic in `camera` process immediately when QR scanning is triggered.
 
-**Crash signature:**
-- `pc=0xfff1c848`, `dfsr=0x000018ff` (debug event fault), camera sysmodule kernel thread
-- `r4=0xffffffff`, `r6=0xffff9000` (invalid handle / kernel error code on stack)
-- Identical crash across two separate runs — deterministic
+**Suspected cause:** citro2d/citro3d may be holding a GSP or memory mapping that conflicts with the camera sysmodule's DMA setup.
 
-**What was tried:** Removing the `ui_exit()`/`ui_init()` cycle around `qr_scan()` (previously suspected of disturbing GSP/GPU state during DMA). Panic persists — root cause is elsewhere.
+---
 
-**Suspected cause:** citro2d/citro3d may be holding a GSP or memory mapping that conflicts with the camera sysmodule's DMA setup, even when citro2d is just idle (no frames submitted). May need to explicitly call `C3D_FrameEnd` / pause the GPU before `camInit()`, or investigate whether `CAMU_SetReceiving` requires the CPU-side GPU to be fully quiesced.
+## [BUG] Black screen on launch, no interaction, wifi cut
 
-**To investigate:**
-- Does the panic happen if citro2d is never inited (console-only fallback)?
-- Does calling `gspWaitForVBlank()` + a dummy `C3D_FrameBegin/End` before `camInit()` help?
-- Check if `GSPGPU_FlushDataCache` before `CAMU_SetReceiving` is needed (was in the old RESET_ONESHOT version, removed in RESET_STICKY version)
+**Branch:** `feat/citro2d-ui-step1`
+
+**Symptom:** App launches to a black screen with no input response. Wireless connection drops.
+
+**Root causes identified:**
+1. `C2D_TargetClear` called after `C2D_SceneBegin` — must be before.
+2. `C2D_FontLoadSystem` return value not checked — NULL font crashes on some firmwares.
+3. `LIBDIRS` missing citro2d/citro3d lib path — linker may pick wrong lib versions.
+
+**Fix in progress.**
