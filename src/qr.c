@@ -10,38 +10,30 @@
  *                  by a mutex. Increments frame_seq on every new frame so the
  *                  main thread can detect whether the buffer changed.
  *
- * Decode strategy (lessons from four log sessions):
+ * Decode strategy:
  *
  *   Session 1: DATA_ECC at 2x -- module pitch too small, Otsu threshold fails.
  *   Session 2: Adaptive threshold -> FORMAT_ECC; mutex held during processing
  *              -> DMA buffer error cascade.
  *   Session 3: Mutex fixed, buffer errors gone. Version still v13/v14/v15 on
  *              same physical QR. Unsharp mask added.
- *   Session 4: Version STILL jumps (v13/v14/v15) within 700ms. QR cannot
- *              regenerate that fast -> quirc is genuinely misreading the
- *              version. Root cause: ARM11 @ 268 MHz is too slow to finish
- *              unsharp on 400x240 (864k multiply-adds) AND render within
- *              33 ms. The main loop overruns, decoding the same stale frame
- *              multiple times. Also, memcpy(shared_buf) is not atomic vs the
- *              camera thread DMA copy -> occasional torn frames -> version
- *              misread.
+ *   Session 4: Version STILL jumps (v13/v14/v15) within 700ms. Root cause
+ *              identified: ctx->shared_buf was calloc'd (regular heap, cached).
+ *              Camera thread writes via memcpy + GSPGPU_FlushDataCache (GPU),
+ *              but no CPU-side cache barrier. Main thread reads stale cache
+ *              lines -> torn frames -> corrupted module data for quirc.
  *
  *   Fix (this version):
- *     1. Frame sequence counter (frame_seq, u32 volatile) -- incremented by
- *        cam thread under mutex after every memcpy. Main thread skips decode
- *        if seq hasn't changed since last decode. Eliminates stale re-decodes.
- *     2. Drop 1x full-res path -- 400x240 unsharp is too expensive and the
- *        1x path never succeeded in any session. Saves ~96 KB static RAM.
- *     3. Keep 2x (200x120) + unsharp. At ~216k ops this is fast enough.
- *     4. Unsharp amount reduced from 1.5 to 1.0 (out = 2*v - blur) to avoid
- *        occasional FORMAT_ECC caused by over-sharpening the format strips.
+ *     1. shared_buf now linearAlloc'd (like dma_buf) so it lives in the same
+ *        coherent memory region. GSPGPU_InvalidateDataCache called on main
+ *        thread side before reading, mirroring the camera thread flush.
+ *     2. __dsb() after memcpy in camera thread for full ARM11 data sync.
+ *     3. frame_seq counter retained -- skip decode on unchanged frames.
  *
  * Stack note: large buffers are static.
- *   s_frame_buf -- 192000 bytes (local copy of camera frame, u16)
+ *   s_frame_buf -- 192000 bytes (local copy, u16)
  *   s_grey2     --  24000 bytes (200x120 greyscale)
  *   s_sharp2    --  24000 bytes (200x120 sharpened)
- *   s_qr_code   --   ~3940 bytes
- *   s_qr_data   --   ~8910 bytes
  */
 
 #include <3ds.h>
@@ -66,10 +58,10 @@
 #define EV_COUNT   3
 
 typedef struct {
-    u16             *shared_buf;
+    u16             *shared_buf;   /* linearAlloc'd -- cache-coherent with dma_buf */
     Handle           mutex;
     Handle           cancel_event;
-    volatile u32     frame_seq;     /* incremented each time shared_buf is updated */
+    volatile u32     frame_seq;
     volatile bool    finished;
     Result           result;
 } cam_ctx_t;
@@ -129,8 +121,9 @@ static void cam_thread_fn(void *arg) {
             GSPGPU_InvalidateDataCache(dma_buf, CAM_BUF_SZ);
             svcWaitSynchronization(ctx->mutex, U64_MAX);
             memcpy(ctx->shared_buf, dma_buf, CAM_BUF_SZ);
+            __dsb();  /* ARM11 data sync barrier: ensure memcpy visible before seq++ */
             GSPGPU_FlushDataCache(ctx->shared_buf, CAM_BUF_SZ);
-            ctx->frame_seq++;   /* signal new frame available */
+            ctx->frame_seq++;
             svcReleaseMutex(ctx->mutex);
             res = CAMU_SetReceiving(&events[EV_RECV], dma_buf,
                                      PORT_CAM1, CAM_BUF_SZ, (s16)transfer_unit);
@@ -168,9 +161,9 @@ cleanup_linear:
 // ---------------------------------------------------------------------------
 // Static buffers -- off the stack
 // ---------------------------------------------------------------------------
-static u16 s_frame_buf[CAM_WIDTH * CAM_HEIGHT];   /* local frame copy */
-static u8  s_grey2[W2 * H2];                      /* 200x120 greyscale */
-static u8  s_sharp2[W2 * H2];                     /* 200x120 sharpened */
+static u16 s_frame_buf[CAM_WIDTH * CAM_HEIGHT];
+static u8  s_grey2[W2 * H2];
+static u8  s_sharp2[W2 * H2];
 
 static struct quirc_code s_qr_code;
 static struct quirc_data s_qr_data;
@@ -187,7 +180,6 @@ static inline u8 rgb565_luma(u16 px) {
 
 // ---------------------------------------------------------------------------
 // unsharp_mask: 3x3 box-blur unsharp, amount=1.0 (out = 2*v - blur).
-// Amount reduced from 1.5 to avoid over-sharpening QR format strips.
 // ---------------------------------------------------------------------------
 static void unsharp_mask(const u8 *src, u8 *dst, int w, int h) {
     for (int y = 0; y < h; y++) {
@@ -202,7 +194,7 @@ static void unsharp_mask(const u8 *src, u8 *dst, int w, int h) {
             }
             int v     = src[y * w + x];
             int blur  = sum / 9;
-            int sharp = 2 * v - blur;   /* amount=1.0 */
+            int sharp = 2 * v - blur;
             if (sharp < 0)   sharp = 0;
             if (sharp > 255) sharp = 255;
             dst[y * w + x] = (u8)sharp;
@@ -211,7 +203,7 @@ static void unsharp_mask(const u8 *src, u8 *dst, int w, int h) {
 }
 
 // ---------------------------------------------------------------------------
-// try_decode: feed buf to qrc, attempt normal + flipped decode
+// try_decode
 // ---------------------------------------------------------------------------
 static bool try_decode(struct quirc *qrc, const u8 *buf, int w, int h,
                        int frame, int scale) {
@@ -255,15 +247,17 @@ int qr_scan(char *out_buf, size_t out_len) {
     cam_ctx_t *ctx = (cam_ctx_t *)calloc(1, sizeof(cam_ctx_t));
     if (!ctx) return QR_ERROR;
 
-    ctx->shared_buf = (u16 *)calloc(1, CAM_BUF_SZ);
+    /* linearAlloc: same memory region as dma_buf -> cache coherent */
+    ctx->shared_buf = (u16 *)linearAlloc(CAM_BUF_SZ);
     if (!ctx->shared_buf) { free(ctx); return QR_ERROR; }
+    memset(ctx->shared_buf, 0, CAM_BUF_SZ);
 
     if (R_FAILED(svcCreateMutex(&ctx->mutex, false))) {
-        free(ctx->shared_buf); free(ctx); return QR_ERROR;
+        linearFree(ctx->shared_buf); free(ctx); return QR_ERROR;
     }
     if (R_FAILED(svcCreateEvent(&ctx->cancel_event, RESET_STICKY))) {
         svcCloseHandle(ctx->mutex);
-        free(ctx->shared_buf); free(ctx); return QR_ERROR;
+        linearFree(ctx->shared_buf); free(ctx); return QR_ERROR;
     }
     ctx->finished  = false;
     ctx->frame_seq = 0;
@@ -274,7 +268,7 @@ int qr_scan(char *out_buf, size_t out_len) {
         if (qrc2) quirc_destroy(qrc2);
         svcCloseHandle(ctx->cancel_event);
         svcCloseHandle(ctx->mutex);
-        free(ctx->shared_buf); free(ctx);
+        linearFree(ctx->shared_buf); free(ctx);
         return QR_ERROR;
     }
 
@@ -287,13 +281,13 @@ int qr_scan(char *out_buf, size_t out_len) {
         quirc_destroy(qrc2);
         svcCloseHandle(ctx->cancel_event);
         svcCloseHandle(ctx->mutex);
-        free(ctx->shared_buf); free(ctx);
+        linearFree(ctx->shared_buf); free(ctx);
         return QR_ERROR;
     }
 
-    int result       = QR_CANCELLED;
-    int frames       = 0;
-    u32 last_seq     = 0xFFFFFFFF;   /* sentinel: decode only on new frames */
+    int result   = QR_CANCELLED;
+    int frames   = 0;
+    u32 last_seq = 0xFFFFFFFF;
 
     while (aptMainLoop() && !ctx->finished) {
         hidScanInput();
@@ -309,6 +303,9 @@ int qr_scan(char *out_buf, size_t out_len) {
 
         svcWaitSynchronization(ctx->mutex, U64_MAX);
         u32 cur_seq = ctx->frame_seq;
+        /* Invalidate CPU cache for shared_buf before reading (matches camera
+           thread's FlushDataCache, ensures we don't read stale lines) */
+        GSPGPU_InvalidateDataCache(ctx->shared_buf, CAM_BUF_SZ);
         ui_cam_tex_upload(ctx->shared_buf, CAM_WIDTH, CAM_HEIGHT);
         if (cur_seq != last_seq)
             memcpy(s_frame_buf, ctx->shared_buf, CAM_BUF_SZ);
@@ -317,7 +314,6 @@ int qr_scan(char *out_buf, size_t out_len) {
         ui_target(GFX_TOP);
         ui_cam_tex_draw(0.0f, 0.0f, (float)SCREEN_TOP_W, (float)SCREEN_H);
 
-        /* Crosshair */
         float cx = SCREEN_TOP_W / 2.0f, cfy = SCREEN_H / 2.0f;
         float arm = 28.0f, gap = 7.0f;
         ui_rect(cx - arm,  cfy - 1.0f, (arm - gap) * 2.0f, 2.0f, COL_LINE1);
@@ -339,7 +335,6 @@ int qr_scan(char *out_buf, size_t out_len) {
 
         ui_frame_end();
 
-        /* ---- Decode only on new frames ---- */
         if (cur_seq == last_seq) continue;
         last_seq = cur_seq;
 
@@ -385,7 +380,7 @@ done:
     quirc_destroy(qrc2);
     svcCloseHandle(ctx->cancel_event);
     svcCloseHandle(ctx->mutex);
-    free(ctx->shared_buf);
+    linearFree(ctx->shared_buf);
     free(ctx);
 
     LOG("qr_scan: done (result=%d, frames=%d)", result, frames);
