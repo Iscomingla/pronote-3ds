@@ -11,29 +11,23 @@
  *
  * Decode strategy history:
  *
- *   Session 1: DATA_ECC at 2x -- module pitch too small.
+ *   Session 1: DATA_ECC at 2x.
  *   Session 2: Mutex held during processing -> DMA cascade.
  *   Session 3: Version v13/v14/v15 jumps -> unsharp added.
- *   Session 4: shared_buf was calloc (cached heap) -> stale CPU cache lines
- *              -> torn frames -> wrong version reads. Fixed with linearAlloc
- *              + __dsb() + InvalidateDataCache on read side.
- *   Session 5: Version mostly stable at v13, but DATA_ECC persists.
- *              Diagnosis: unsharp mask creates ringing/halos at module edges;
- *              quirc thresholds on the halo as a bit flip. High-density QR
- *              (v13, jeton payload) has low ECC headroom so even a few bit
- *              errors are unrecoverable.
- *
- *   Fix (this version):
- *     1. Drop unsharp mask entirely. quirc's internal adaptive threshold
- *        handles normal camera output well without pre-sharpening.
- *     2. Try 1x full-res (400x240) FIRST -- more pixels per module means
- *        less interpolation error and better finder-pattern corner detection.
- *        Without unsharp the luma loop is cheap enough at full res.
- *     3. Fall back to 2x (200x120) if 1x doesn't decode, for cases where
- *        the code fills less than half the frame.
+ *   Session 4: shared_buf calloc -> stale CPU cache -> torn frames. Fixed
+ *              with linearAlloc + __dsb() + InvalidateDataCache.
+ *   Session 5: DATA_ECC persists. Unsharp creates module-edge halos -> bits
+ *              flip. Dropped unsharp, added 1x full-res path.
+ *   Session 6: Version rock-solid at v13. Still DATA_ECC every frame.
+ *              Suspected: Pronote uses high ECC level (H) or a mask pattern
+ *              that is hard to threshold, OR FORMAT_ECC is silently recovering
+ *              to the wrong mask pattern -> all data modules wrong.
+ *              Added diagnostic logging: ecc_level, mask, eci, data_type
+ *              from quirc_code / quirc_data so we can see what the format
+ *              strip is actually reporting.
  *
  * Static buffer layout:
- *   s_frame_buf  -- 192000 B  u16[400*240]  local frame copy
+ *   s_frame_buf  -- 192000 B  u16[400*240]
  *   s_grey1      --  96000 B  u8[400*240]   1x greyscale
  *   s_grey2      --  24000 B  u8[200*120]   2x greyscale
  *   s_qr_code    --   ~3940 B
@@ -53,8 +47,8 @@
 #define CAM_HEIGHT  240
 #define CAM_BUF_SZ  (CAM_WIDTH * CAM_HEIGHT * sizeof(u16))
 
-#define W2  (CAM_WIDTH  / 2)   /* 200 */
-#define H2  (CAM_HEIGHT / 2)   /* 120 */
+#define W2  (CAM_WIDTH  / 2)
+#define H2  (CAM_HEIGHT / 2)
 
 #define EV_CANCEL  0
 #define EV_RECV    1
@@ -62,7 +56,7 @@
 #define EV_COUNT   3
 
 typedef struct {
-    u16             *shared_buf;   /* linearAlloc -- cache-coherent with dma_buf */
+    u16             *shared_buf;
     Handle           mutex;
     Handle           cancel_event;
     volatile u32     frame_seq;
@@ -71,7 +65,7 @@ typedef struct {
 } cam_ctx_t;
 
 // ---------------------------------------------------------------------------
-// Camera thread
+// Camera thread (unchanged from previous session)
 // ---------------------------------------------------------------------------
 static void cam_thread_fn(void *arg) {
     cam_ctx_t *ctx = (cam_ctx_t *)arg;
@@ -125,7 +119,7 @@ static void cam_thread_fn(void *arg) {
             GSPGPU_InvalidateDataCache(dma_buf, CAM_BUF_SZ);
             svcWaitSynchronization(ctx->mutex, U64_MAX);
             memcpy(ctx->shared_buf, dma_buf, CAM_BUF_SZ);
-            __dsb();  /* ARM11 DSB: memcpy writes visible before frame_seq++ */
+            __dsb();
             GSPGPU_FlushDataCache(ctx->shared_buf, CAM_BUF_SZ);
             ctx->frame_seq++;
             svcReleaseMutex(ctx->mutex);
@@ -163,18 +157,15 @@ cleanup_linear:
 }
 
 // ---------------------------------------------------------------------------
-// Static buffers -- off the stack
+// Static buffers
 // ---------------------------------------------------------------------------
-static u16 s_frame_buf[CAM_WIDTH * CAM_HEIGHT];  /* 192 KB */
-static u8  s_grey1[CAM_WIDTH * CAM_HEIGHT];       /*  96 KB -- 1x greyscale */
-static u8  s_grey2[W2 * H2];                      /*  24 KB -- 2x greyscale */
+static u16 s_frame_buf[CAM_WIDTH * CAM_HEIGHT];
+static u8  s_grey1[CAM_WIDTH * CAM_HEIGHT];
+static u8  s_grey2[W2 * H2];
 
 static struct quirc_code s_qr_code;
 static struct quirc_data s_qr_data;
 
-// ---------------------------------------------------------------------------
-// rgb565_luma: BT.601 luma
-// ---------------------------------------------------------------------------
 static inline u8 rgb565_luma(u16 px) {
     u32 r8 = ((px >> 11) & 0x1F) << 3;
     u32 g8 = ((px >>  5) & 0x3F) << 2;
@@ -183,7 +174,7 @@ static inline u8 rgb565_luma(u16 px) {
 }
 
 // ---------------------------------------------------------------------------
-// try_decode: feed buf[w*h] to qrc, try normal + flipped decode
+// try_decode -- with diagnostic logging of format strip fields
 // ---------------------------------------------------------------------------
 static bool try_decode(struct quirc *qrc, const u8 *buf, int w, int h,
                        int frame, int scale) {
@@ -199,12 +190,27 @@ static bool try_decode(struct quirc *qrc, const u8 *buf, int w, int h,
 
     for (int i = 0; i < n; i++) {
         quirc_extract(qrc, i, &s_qr_code);
-        LOG("qr_scan: frame %d scale %dx code %d size=%d (v%d)",
-            frame, scale, i, s_qr_code.size, (s_qr_code.size - 17) / 4);
+
+        /* Log format strip fields from quirc_code:
+         *   ecc_level: 0=M 1=L 2=H 3=Q
+         *   mask:      0-7 (XOR mask pattern applied to data modules)
+         * These come from the format information strips and are decoded
+         * before ECC. If ecc_level or mask jump around between frames,
+         * the format strip is being misread (image quality / contrast). */
+        LOG("qr_scan: frame %d scale %dx code %d size=%d (v%d) ecc=%d mask=%d",
+            frame, scale, i,
+            s_qr_code.size, (s_qr_code.size - 17) / 4,
+            (int)s_qr_code.ecc_level, (int)s_qr_code.mask);
 
         quirc_decode_error_t err = quirc_decode(&s_qr_code, &s_qr_data);
         if (err == QUIRC_SUCCESS) {
-            LOG("qr_scan: decoded (normal) frame %d scale %dx", frame, scale);
+            LOG("qr_scan: decoded frame %d scale %dx: version=%d ecc=%d dtype=%d eci=%lu len=%d",
+                frame, scale,
+                (int)s_qr_data.version,
+                (int)s_qr_data.ecc_level,
+                (int)s_qr_data.data_type,
+                (unsigned long)s_qr_data.eci,
+                (int)s_qr_data.payload_len);
             return true;
         }
         LOG("qr_scan: normal decode err %d (scale %dx)", (int)err, scale);
@@ -241,7 +247,6 @@ int qr_scan(char *out_buf, size_t out_len) {
     ctx->finished  = false;
     ctx->frame_seq = 0;
 
-    /* 1x quirc instance (400x240) -- try first, more pixels per module */
     struct quirc *qrc1 = quirc_new();
     if (!qrc1 || quirc_resize(qrc1, CAM_WIDTH, CAM_HEIGHT) < 0) {
         LOG("qr_scan: quirc 1x init failed");
@@ -252,7 +257,6 @@ int qr_scan(char *out_buf, size_t out_len) {
         return QR_ERROR;
     }
 
-    /* 2x quirc instance (200x120) -- fallback */
     struct quirc *qrc2 = quirc_new();
     if (!qrc2 || quirc_resize(qrc2, W2, H2) < 0) {
         LOG("qr_scan: quirc 2x init failed");
@@ -289,7 +293,6 @@ int qr_scan(char *out_buf, size_t out_len) {
             break;
         }
 
-        /* ---- Render ---- */
         ui_frame_begin();
         ui_clear_target(ui_get_target(GFX_TOP),    COL_BLACK);
         ui_clear_target(ui_get_target(GFX_BOTTOM), COL_BG);
@@ -329,16 +332,14 @@ int qr_scan(char *out_buf, size_t out_len) {
         if (cur_seq == last_seq) continue;
         last_seq = cur_seq;
 
-        /* ---- 1x full-res greyscale (no unsharp -- quirc adaptive threshold
-           handles camera output fine; unsharp causes module-edge halos that
-           flip bits and exhaust ECC on high-density codes) ---- */
+        /* 1x full-res */
         for (int i = 0; i < CAM_WIDTH * CAM_HEIGHT; i++)
             s_grey1[i] = rgb565_luma(s_frame_buf[i]);
 
         if (try_decode(qrc1, s_grey1, CAM_WIDTH, CAM_HEIGHT, frames, 1))
             goto success;
 
-        /* ---- 2x downsampled greyscale (fallback for small/distant codes) ---- */
+        /* 2x downsampled fallback */
         for (int qy = 0; qy < H2; qy++) {
             for (int qx = 0; qx < W2; qx++) {
                 u32 sum = 0;
