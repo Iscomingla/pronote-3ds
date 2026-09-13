@@ -1,13 +1,12 @@
 /*
  * aes.h -- AES-128 single-header implementation (public domain, B. Gladman style)
- * Supports ECB block encrypt/decrypt only. CBC is built on top in crypto.c.
+ * Supports ECB block decrypt only. CBC is built on top in crypto.c.
  */
 #ifndef AES128_H
 #define AES128_H
 #include <stdint.h>
 #include <string.h>
 
-/* AES S-box and inverse S-box */
 static const uint8_t aes_sbox[256]={
     0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
     0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
@@ -46,60 +45,72 @@ static const uint8_t aes_isbox[256]={
 };
 static const uint8_t aes_rcon[11]={0,0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,0x1b,0x36};
 
-static inline uint8_t aes_xtime(uint8_t x){return (x<<1)^((x>>7)?0x1b:0);}
-static inline uint8_t aes_mul(uint8_t a,uint8_t b){
-    uint8_t r=0,t=a;
-    for(int i=0;i<8;i++){if(b&1)r^=t;t=aes_xtime(t);b>>=1;}
+static inline uint8_t aes_xtime(uint8_t x){return (uint8_t)((x<<1)^((x>>7)?0x1b:0));}
+static inline uint8_t aes_mul(uint8_t a, uint8_t b){
+    uint8_t r=0, tmp=a;
+    for(int i=0;i<8;i++){if(b&1)r^=tmp; tmp=aes_xtime(tmp); b>>=1;}
     return r;
+}
+
+/* Rotate a 4-byte word left by one byte */
+static inline void aes_inv_shift_rows(uint8_t s[16]){
+    uint8_t tmp;
+    /* row 1: right shift by 1 */
+    tmp=s[13]; s[13]=s[9]; s[9]=s[5]; s[5]=s[1]; s[1]=tmp;
+    /* row 2: right shift by 2 (swap pairs) */
+    tmp=s[2];  s[2]=s[10]; s[10]=tmp;
+    tmp=s[6];  s[6]=s[14]; s[14]=tmp;
+    /* row 3: right shift by 3 = left shift by 1 */
+    tmp=s[3];  s[3]=s[15]; s[15]=s[11]; s[11]=s[7]; s[7]=tmp;
+}
+
+static inline void aes_inv_mix_col(uint8_t *col){
+    uint8_t a=col[0], b=col[1], c=col[2], d=col[3];
+    col[0]=aes_mul(a,0x0e)^aes_mul(b,0x0b)^aes_mul(c,0x0d)^aes_mul(d,0x09);
+    col[1]=aes_mul(a,0x09)^aes_mul(b,0x0e)^aes_mul(c,0x0b)^aes_mul(d,0x0d);
+    col[2]=aes_mul(a,0x0d)^aes_mul(b,0x09)^aes_mul(c,0x0e)^aes_mul(d,0x0b);
+    col[3]=aes_mul(a,0x0b)^aes_mul(b,0x0d)^aes_mul(c,0x09)^aes_mul(d,0x0e);
 }
 
 typedef struct { uint8_t rk[11][16]; } AES128_CTX;
 
 static void aes128_init(AES128_CTX *ctx, const uint8_t key[16]){
-    memcpy(ctx->rk[0],key,16);
-    for(int r=1;r<=10;r++){
-        uint8_t *p=ctx->rk[r-1], *q=ctx->rk[r];
-        uint8_t t[4]={aes_sbox[p[13]],aes_sbox[p[14]],aes_sbox[p[15]],aes_sbox[p[12]]};
-        t[0]^=aes_rcon[r];
-        for(int i=0;i<4;i++) q[i]   =p[i]   ^t[i];
-        for(int i=4;i<8;i++) q[i]   =p[i]   ^q[i-4];
-        for(int i=8;i<12;i++) q[i]  =p[i]   ^q[i-4];
-        for(int i=12;i<16;i++) q[i] =p[i]   ^q[i-4];
+    memcpy(ctx->rk[0], key, 16);
+    for(int r=1; r<=10; r++){
+        uint8_t *p = ctx->rk[r-1];
+        uint8_t *q = ctx->rk[r];
+        /* RotWord + SubWord + Rcon on last word of previous round key */
+        uint8_t tw[4] = {
+            (uint8_t)(aes_sbox[p[13]] ^ aes_rcon[r]),
+            aes_sbox[p[14]],
+            aes_sbox[p[15]],
+            aes_sbox[p[12]]
+        };
+        for(int i=0;  i<4;  i++) q[i]  = p[i]  ^ tw[i];
+        for(int i=4;  i<16; i++) q[i]  = p[i]  ^ q[i-4];
     }
 }
 
-/* Decrypt one 16-byte block in place */
+/* Decrypt one 16-byte block in place (AES-128 ECB) */
 static void aes128_decrypt_block(const AES128_CTX *ctx, uint8_t blk[16]){
     uint8_t s[16];
-    /* AddRoundKey (round 10) */
-    for(int i=0;i<16;i++) s[i]=blk[i]^ctx->rk[10][i];
+    int i, r;
 
-    for(int r=9;r>=1;r--){
-        /* InvShiftRows */
-        uint8_t t;
-        t=s[13];s[13]=s[9];s[9]=s[5];s[5]=s[1];s[1]=t;
-        t=s[2];s[2]=s[10];s[10]=t; t=s[6];s[6]=s[14];s[14]=t;
-        t=s[3];s[3]=s[7];s[7]=s[11];s[11]=s[15];s[15]=t;
-        /* InvSubBytes */
-        for(int i=0;i<16;i++) s[i]=aes_isbox[s[i]];
-        /* AddRoundKey */
-        for(int i=0;i<16;i++) s[i]^=ctx->rk[r][i];
-        /* InvMixColumns */
-        for(int c=0;c<4;c++){
-            uint8_t *col=s+c*4;
-            uint8_t a=col[0],b=col[1],cc=col[2],d=col[3];
-            col[0]=aes_mul(a,0x0e)^aes_mul(b,0x0b)^aes_mul(cc,0x0d)^aes_mul(d,0x09);
-            col[1]=aes_mul(a,0x09)^aes_mul(b,0x0e)^aes_mul(cc,0x0b)^aes_mul(d,0x0d);
-            col[2]=aes_mul(a,0x0d)^aes_mul(b,0x09)^aes_mul(cc,0x0e)^aes_mul(d,0x0b);
-            col[3]=aes_mul(a,0x0b)^aes_mul(b,0x0d)^aes_mul(cc,0x09)^aes_mul(d,0x0e);
-        }
+    /* Initial AddRoundKey (round 10) */
+    for(i=0; i<16; i++) s[i] = blk[i] ^ ctx->rk[10][i];
+
+    /* Rounds 9 down to 1 */
+    for(r=9; r>=1; r--){
+        aes_inv_shift_rows(s);
+        for(i=0; i<16; i++) s[i] = aes_isbox[s[i]];
+        for(i=0; i<16; i++) s[i] ^= ctx->rk[r][i];
+        for(i=0; i<4;  i++) aes_inv_mix_col(s + i*4);
     }
+
     /* Final round (no InvMixColumns) */
-    t=s[13];s[13]=s[9];s[9]=s[5];s[5]=s[1];s[1]=t;
-    t=s[2];s[2]=s[10];s[10]=t; t=s[6];s[6]=s[14];s[14]=t;
-    t=s[3];s[3]=s[7];s[7]=s[11];s[11]=s[15];s[15]=t;
-    for(int i=0;i<16;i++) s[i]=aes_isbox[s[i]];
-    for(int i=0;i<16;i++) blk[i]=s[i]^ctx->rk[0][i];
+    aes_inv_shift_rows(s);
+    for(i=0; i<16; i++) s[i] = aes_isbox[s[i]];
+    for(i=0; i<16; i++) blk[i] = s[i] ^ ctx->rk[0][i];
 }
-#undef t
+
 #endif /* AES128_H */
