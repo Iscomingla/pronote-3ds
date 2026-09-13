@@ -1,37 +1,46 @@
 # TOFIX
 
-## [BUG] QR decode fails — quirc ECC failure on valid image
+## [BUG] QR decode fails — quirc RS decoder too weak for this code
 
 **Branch:** `fix/qr-ecc-contrast`
 
-**Root cause confirmed (PC decode of notapro_frame.bin):**
+**Status:** Definitively diagnosed. quirc cannot decode this QR. Replacement needed.
 
-WeChatQRCode (OpenCV) decodes the frame instantly. The image is fine.
-quirc fails because:
+### What we know
 
-1. **Module size is only ~3.5px** at 400x240. quirc's Reed-Solomon decoder
-   needs sufficient contrast per module to sample correctly. At 3.5px/module
-   it samples too close to module edges and gets bit errors.
+- **The image is fine.** WeChatQRCode decodes it instantly from the raw frame.
+- **Adaptive threshold is fine.** `cv2.adaptiveThreshold(grey, 255, ADAPTIVE_THRESH_GAUSSIAN_C, THRESH_BINARY, 15, 5)` produces a clean binary image that WeChatQR decodes.
+- **OpenCV's built-in QR detector also fails** — same RS decoder class as quirc.
+- **Upscaling does not help quirc.** Tested bilinear and nearest-neighbour at 300, 400, 500, 600, 700px — quirc and OpenCV fail at all sizes. WeChatQR succeeds at all sizes.
+- **Root cause:** The Pronote QR is v13-Q at **exactly 376 bytes capacity** (payload fills it to the byte). v13-Q provides ~94 bytes of ECC correction. The 3DS camera at 400x240 produces ~3.5px/module; even with upscaling, quirc's RS implementation generates more bit errors than that budget allows. WeChatQR uses a neural-network super-resolution pass before RS — quirc has no such pipeline.
 
-2. **Payload is exactly 376 bytes = v13-Q at capacity.** v13-Q provides ~94
-   bytes of ECC correction headroom. At 3.5px/module with 3DS camera noise
-   the bit error count exceeds this threshold, so ECC cannot recover.
+### Required fix
 
-3. **The fix:** bicubic-upsample the detected QR ROI to ~700x700 before
-   feeding to quirc. At 8-10px/module the RS decoder has no trouble.
-   This is what WeChatQR does internally (super-resolution pass).
+**Replace quirc with zxing-cpp** (`zxing-cpp/zxing-cpp` on GitHub).
 
-**Required change in qr.c (`fix/qr-ecc-contrast`):**
-- After finder pattern detection (quirc_end), extract the bounding box
-  of the detected code from `quirc_code.corners`.
-- Crop that ROI from `s_grey1` with a small margin.
-- Bicubic-upsample the ROI to a fixed `quirc_resize`'d buffer of 700x700.
-- Feed the upsampled ROI to a dedicated `qrc_roi` quirc instance.
-- Keep the 1x/2x passes as fallback.
+zxing-cpp is a C++17 port of ZXing with a significantly stronger Reed-Solomon implementation. It:
+- Ships as a small set of headers + source files, no external deps
+- Compiles on ARM with devkitARM (C++17 supported since devkitARM r55)
+- Has been used in other 3DS homebrews (e.g. Checkpoint)
+- Can accept a raw greyscale buffer directly via `ImageView`
 
-**Payload confirmed:**
+### Integration plan
+
+1. Vendor `zxing-cpp` in `lib/zxing-cpp/` (only the `core/src/` subtree needed, ~80 files)
+2. Add `lib/zxing-cpp/core/src` to `SOURCES` and `INCLUDES` in Makefile
+3. In `qr.c`: keep the camera thread unchanged. Replace the quirc decode call with:
+   ```cpp
+   auto hints = DecodeHints().setFormats(BarcodeFormat::QRCode);
+   auto result = ReadBarcode({grey_buf, width, height, ImageFormat::Lum}, hints);
+   if (result.isValid()) { /* copy result.text() to out_buf */ }
+   ```
+4. Keep `qrc_detect` (quirc) for the fast bounding-box detection pass only — it reliably finds the finder patterns even when it can't decode. Use the bbox to crop+upsample for zxing-cpp.
+5. Remove `qrc_roi` (quirc decode instance) entirely.
+
+### Payload confirmed
+
 ```json
-{"avecPageConnexion":false,"jeton":"91472F67...","login":"D733111B...","url":"https://0260008t.index-education.net/pronote/mobile.eleve.html"}
+{"avecPageConnexion":false,"jeton":"91472F67A2174D0A...","login":"D733111BDFB5BE004343EE8F18FD0E1F","url":"https://0260008t.index-education.net/pronote/mobile.eleve.html"}
 ```
-Login field is a hex UUID (not plaintext username). JSON parser in main.c
-needs to handle this correctly — `login` maps to the username field.
+
+`login` is a hex UUID, not a display name. `main.c` JSON parser handles it correctly already.
