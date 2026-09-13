@@ -5,9 +5,13 @@ A Nintendo 3DS homebrew app to authenticate with Pronote using a QR code jeton +
 ## Requirements
 
 - **devkitPro** with devkitARM — https://devkitpro.org/wiki/Getting_Started
-- **libctru** (included with devkitPro)
+- **libctru** and **citro2d** (included with devkitPro)
 
 No extra pacman packages needed. quirc is vendored under `lib/quirc/`.
+
+```bash
+pacman -S devkitARM 3ds-dev
+```
 
 ## Build
 
@@ -17,54 +21,109 @@ make clean && make
 
 Produces `pronote-3ds.3dsx`. Copy it to `/3ds/pronote-3ds.3dsx` on your SD card and launch via Homebrew Launcher.
 
-## Usage
+---
 
-### Login flow
+## Login setup
 
-1. Press **R** to open the QR scanner
-2. Point the **outer camera** at your Pronote QR code
-3. Username and jeton are filled automatically
-4. Navigate to **PIN Code** and press **A** to enter your 4-digit PIN
-5. Press **X** to login
+The in-app QR scanner is currently deferred (see TODO). Instead, generate your
+`user.json` on a computer and copy it to your SD card — this takes about a minute.
 
-### Controls
+### Step 1 — Generate the Pronote QR code
+
+1. Open Pronote on your phone or computer
+2. Go to **Settings → QR Code Login** (or the equivalent in your school's Pronote)
+3. A QR code and a 4-digit PIN are shown together — **note the PIN**, you will need it
+
+### Step 2 — Decode the QR code on your computer
+
+Scan or screenshot the QR code, then decode it with any QR reader.
+The payload is a JSON string:
+
+```json
+{"login":"<hex string>","jeton":"<hex string>","url":"https://..."}
+```
+
+Quick ways to decode it:
+
+**Option A — zbar (Linux/macOS)**
+```bash
+zbarimg --raw qr.png
+```
+
+**Option B — Python**
+```python
+from pyzbar.pyzbar import decode
+from PIL import Image
+print(decode(Image.open('qr.png'))[0].data.decode())
+```
+
+**Option C — Online**  
+Upload the screenshot to https://zxing.org/w/decode.jspx or any QR decoder site.
+
+### Step 3 — Create `user.json`
+
+Copy only `login`, `jeton`, and `url` from the decoded payload:
+
+```json
+{
+  "login": "<value from QR>",
+  "jeton": "<value from QR>",
+  "url":   "<value from QR>"
+}
+```
+
+Save it as `user.json`.
+
+### Step 4 — Copy to SD card
+
+```
+SD card:
+  /3ds/notApro/user.json
+```
+
+Create the `notApro` folder if it does not exist. The app also writes its log to
+`/3ds/notApro/log.txt`.
+
+### Step 5 — Launch and enter PIN
+
+1. Launch **notApro** from Homebrew Launcher
+2. `user.json` is loaded automatically — you will see your username and "Loaded ✓"
+3. Press **A** to enter your 4-digit PIN (the one shown alongside the QR code)
+4. Press **X** to login
+
+> The QR code and PIN are only valid for a limited time (usually 10 minutes).
+> Generate a new one if login fails.
+
+---
+
+## Controls
 
 | Button | Action |
 |--------|--------|
-| UP / DOWN | Navigate fields |
-| A | Edit field / Scan QR (on jeton field) |
-| Y | Clear field |
-| R | Open QR scanner |
+| A | Enter PIN |
+| Y | Clear PIN |
 | X | Login |
 | START | Exit |
 
-### QR code format
-
-The Pronote QR payload is JSON:
-
-```json
-{"login":"<hex string>","jeton":"<hex string>","url":"..."}
-```
-
-Both `login` and `jeton` are AES-CBC hex-encoded ciphertexts (decrypted with your 4-digit PIN).
-The Pronote protocol defines no maximum length for either field; the app allocates 512 chars for the jeton, which is well beyond any observed real-world value.
+---
 
 ## Project structure
 
 ```
 src/
-  main.c      — UI and input loop
-  qr.c        — Camera capture + quirc QR decoder
+  main.c      — UI, file loading, input loop
   network.c   — HTTP stub (WIP)
+  ui.c        — citro2d rendering layer
 include/
-  qr.h
+  ui.h
   network.h
-lib/quirc/    — Vendored quirc QR library
+lib/quirc/    — Vendored quirc QR library (used by the deferred scanner)
 ```
 
-## Building a CIA
+## Log file
 
-See `ADVANCED.md` for CIA packaging instructions.
+The app writes a timestamped session log to `sdmc:/3ds/notApro/log.txt`.
+Useful for debugging if login fails.
 
 ## Disclaimer
 
