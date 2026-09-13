@@ -14,15 +14,12 @@ TARGET			:=	$(notdir $(CURDIR))
 BUILD			:=	build
 SOURCES			:=	src lib/quirc
 DATA			:=	data
-INCLUDES		:=	include lib
+INCLUDES		:=	include lib lib/crypto
 GRAPHICS		:=	gfx
 GFXBUILD		:=	$(BUILD)
 APP_TITLE		:=	notApro
 APP_DESCRIPTION	:=	acces to Pronote student from 3DS
 APP_AUTHOR		:=	Iscomingla
-#ICON			:=
-#ROMFS		:=	romfs
-#GFXBUILD	:=	$(ROMFS)/gfx
 
 #---------------------------------------------------------------------------------
 ARCH	:=	-march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
@@ -203,10 +200,7 @@ MAKEROM := $(HOME)/Apps/3ds/makerom
 cia: $(OUTPUT).3dsx
 	@echo "Building CIA..."
 	@mkdir -p build
-	@echo "Note: Full CIA building requires proper metadata setup"
 	@echo ".3dsx available at: $(OUTPUT).3dsx"
-	@echo "You can install .3dsx using Homebrew Channel or FBI"
-	@echo ""
 	@echo "To build CIA: Use build_cia.sh script"
 
 .PHONY: cia
