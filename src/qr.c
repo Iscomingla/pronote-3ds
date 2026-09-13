@@ -30,6 +30,7 @@
  *              continuous greyscale for its own internal adaptive threshold.
  *              Pre-binarising to {0,255} defeats finder pattern detection.
  *              Fix: remove Otsu, keep only the byteswap.
+ *   Session 9: Ported to fix/camera-preview-decode-stack (static buffers).
  *
  * Static buffer layout (BSS, not stack):
  *   s_frame_buf  -- 192000 B  u16[400*240]
@@ -164,10 +165,9 @@ cleanup_linear:
 // ---------------------------------------------------------------------------
 // Static buffers (BSS — never on the stack)
 // ---------------------------------------------------------------------------
-static u16 s_frame_buf[CAM_WIDTH * CAM_HEIGHT];
-static u8  s_grey1[CAM_WIDTH * CAM_HEIGHT];
-static u8  s_grey2[W2 * H2];
-
+static u16               s_frame_buf[CAM_WIDTH * CAM_HEIGHT];
+static u8                s_grey1[CAM_WIDTH * CAM_HEIGHT];
+static u8                s_grey2[W2 * H2];
 static struct quirc_code s_qr_code;
 static struct quirc_data s_qr_data;
 
@@ -176,19 +176,10 @@ static struct quirc_data s_qr_data;
 //
 // CAMU outputs RGB565 big-endian (high byte first in DMA memory).
 // ARM reads u16 little-endian, so the bytes are swapped on arrival.
+// After __builtin_bswap16: bits[15:11]=R, bits[10:5]=G, bits[4:0]=B.
 //
-// Raw u16 as read by ARM (little-endian read of big-endian bytes):
-//   bits[15:8] = second DMA byte = G[2:0] B[4:0]
-//   bits[ 7:0] = first  DMA byte = R[4:0] G[5:3]
-//
-// After __builtin_bswap16:
-//   bits[15:11] = R[4:0]
-//   bits[10: 5] = G[5:0]
-//   bits[ 4: 0] = B[4:0]
-//
-// Note: do NOT pre-binarise before feeding to quirc. quirc's region-growing
-// (identify.c) needs a continuous greyscale for its internal adaptive
-// threshold. Pre-binarising to {0,255} breaks finder pattern detection.
+// Do NOT pre-binarise before feeding to quirc — quirc's region-growing
+// needs continuous greyscale for its internal adaptive threshold.
 // ---------------------------------------------------------------------------
 static inline u8 rgb565_luma(u16 raw) {
     u16 px = __builtin_bswap16(raw);
@@ -199,7 +190,7 @@ static inline u8 rgb565_luma(u16 raw) {
 }
 
 // ---------------------------------------------------------------------------
-// try_decode: feed greyscale buffer to quirc and attempt decode + flip
+// try_decode: feed greyscale buffer to quirc, attempt normal + flipped decode
 // ---------------------------------------------------------------------------
 static bool try_decode(struct quirc *qrc, const u8 *buf, int w, int h,
                        int frame, int scale) {
@@ -356,7 +347,7 @@ int qr_scan(char *out_buf, size_t out_len) {
         if (try_decode(qrc1, s_grey1, CAM_WIDTH, CAM_HEIGHT, frames, 1))
             goto success;
 
-        // 2x downsampled fallback (2x2 box average)
+        // 2x downsampled fallback
         for (int qy = 0; qy < H2; qy++) {
             for (int qx = 0; qx < W2; qx++) {
                 u32 sum = 0;
