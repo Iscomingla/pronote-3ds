@@ -1,40 +1,32 @@
 /*
  * qr.c -- QR code scanner: 3DS outer camera + quirc + citro2d preview.
  *
- * Architecture (modelled on FBI-NH's remoteinstall.c + capturecam.c):
- *
- *   Main thread:  citro2d render loop -- uploads camera frame as GPU texture,
- *                 decodes with quirc, handles B-cancel.
- *
- *   Camera thread: CAMU DMA loop -- captures frames into shared_buf
- *                  (linearAlloc) protected by a mutex + frame_seq counter.
- *
  * Decode history:
  *
- *   Session 1: DATA_ECC at 2x.
- *   Session 2: Mutex held during processing -> DMA cascade.
- *   Session 3: Version v13/v14/v15 jumps -> unsharp added.
- *   Session 4: shared_buf calloc -> stale CPU cache -> torn frames. Fixed
- *              with linearAlloc + __dsb() + InvalidateDataCache.
- *   Session 5: DATA_ECC persists. Unsharp creates module-edge halos.
- *              Dropped unsharp, added 1x full-res path.
- *   Session 6: Version rock-solid v13. DATA_ECC every frame.
- *              Added corner logging to rule out unstable perspective.
- *   Session 7: Corners stable. DATA_ECC root cause: bswap added based on
- *              wrong assumption about CAMU endianness.
- *   Session 8: QR no longer detected at all — bswap was making luma wrong
- *              while the GPU rendered fine without it (GPU_RGB565 expects
- *              the same byte order CAMU produces). Removed bswap.
- *   Session 10: No detection. Root cause confirmed: ui_cam_tex_upload reads
- *               raw pixels without bswap and display is correct, so raw
- *               bytes are already correct for ARM u16 reads. Bswap in
- *               rgb565_luma was producing garbage luma -> quirc sees noise
- *               -> zero candidates. Fix: remove bswap from rgb565_luma.
+ *   Session 1-9: see fix/camera-preview-decode-stack history.
+ *   Session 10:  bswap in rgb565_luma was producing garbage luma. Fixed.
+ *   Session 11:  ECC failure every frame. Contrast/exposure tried.
+ *   Session 12:  Desktop test on real captured frame (notapro_frame.bin):
+ *                quirc decodes it instantly on raw luma with no preprocessing.
+ *                Conclusion: the image data from CAMU is fine. The bug is
+ *                in the on-device pipeline between camera and quirc.
+ *
+ *   Root cause identified: cache coherency race.
+ *   In the main thread mutex window, ui_cam_tex_upload() calls C3D_TexFlush
+ *   which issues GSPGPU_FlushDataCache on the texture memory. This GSP
+ *   kernel call can re-dirty or re-invalidate cache lines in adjacent
+ *   memory (shared_buf sits in the same linearAlloc pool). The memcpy
+ *   into s_frame_buf that follows reads stale cache lines.
+ *
+ *   Fix: memcpy into s_frame_buf BEFORE ui_cam_tex_upload, so we capture
+ *   the cleanly-invalidated data before the GPU upload can interfere.
+ *   Also added a DSB barrier after the invalidate and before the copy.
+ *   Also log and guard against quirc_begin returning wrong dimensions.
  *
  * Static buffer layout (BSS, not stack):
  *   s_frame_buf  -- 192000 B  u16[400*240]
  *   s_grey1      --  96000 B  u8[400*240]   1x greyscale
- *   s_grey2      --  24000 B  u8[200*120]   2x greyscale (2x2 average)
+ *   s_grey2      --  24000 B  u8[200*120]   2x downsampled
  *   s_qr_code    --   ~3940 B
  *   s_qr_data    --   ~8910 B
  */
@@ -122,6 +114,7 @@ static void cam_thread_fn(void *arg) {
         if (idx == EV_RECV) {
             svcCloseHandle(events[EV_RECV]); events[EV_RECV] = 0;
             GSPGPU_InvalidateDataCache(dma_buf, CAM_BUF_SZ);
+            __dsb();
             svcWaitSynchronization(ctx->mutex, U64_MAX);
             memcpy(ctx->shared_buf, dma_buf, CAM_BUF_SZ);
             __dsb();
@@ -172,15 +165,8 @@ static struct quirc_data s_qr_data;
 
 // ---------------------------------------------------------------------------
 // rgb565_luma: extract luminance from a raw RGB565 u16.
-//
-// CAMU OUTPUT_RGB_565 produces pixels that the ARM CPU reads correctly as
-// little-endian u16: bits[15:11]=R, bits[10:5]=G, bits[4:0]=B.
-// ui_cam_tex_upload confirms this — it passes pixels straight to GPU_RGB565
-// without any byteswap and the preview looks correct.
-// Therefore NO byteswap is needed here.
-//
-// Do NOT pre-binarise before feeding to quirc — quirc's region-growing
-// needs continuous greyscale for its internal adaptive threshold.
+// CAMU OUTPUT_RGB_565 produces correct LE u16 — no byteswap needed.
+// Confirmed by desktop test: raw luma decoded by quirc instantly.
 // ---------------------------------------------------------------------------
 static inline u8 rgb565_luma(u16 px) {
     u32 r8 = ((px >> 11) & 0x1F) << 3;
@@ -190,13 +176,22 @@ static inline u8 rgb565_luma(u16 px) {
 }
 
 // ---------------------------------------------------------------------------
-// try_decode: feed greyscale buffer to quirc, attempt normal + flipped decode
+// try_decode
 // ---------------------------------------------------------------------------
 static bool try_decode(struct quirc *qrc, const u8 *buf, int w, int h,
                        int frame, int scale) {
     int qw = 0, qh = 0;
     uint8_t *qimg = quirc_begin(qrc, &qw, &qh);
-    memcpy(qimg, buf, (size_t)qw * qh);
+
+    // Guard: log if quirc internal dimensions don't match what we resized to
+    if (qw != w || qh != h) {
+        LOG("try_decode scale %dx: quirc dim mismatch qw=%d qh=%d expected %dx%d",
+            scale, qw, qh, w, h);
+        quirc_end(qrc);
+        return false;
+    }
+
+    memcpy(qimg, buf, (size_t)w * h);
     quirc_end(qrc);
 
     int n = quirc_count(qrc);
@@ -206,7 +201,6 @@ static bool try_decode(struct quirc *qrc, const u8 *buf, int w, int h,
 
     for (int i = 0; i < n; i++) {
         quirc_extract(qrc, i, &s_qr_code);
-
         LOG("qr_scan: frame %d scale %dx code %d size=%d (v%d) "
             "TL(%d,%d) TR(%d,%d) BR(%d,%d) BL(%d,%d)",
             frame, scale, i,
@@ -218,19 +212,18 @@ static bool try_decode(struct quirc *qrc, const u8 *buf, int w, int h,
 
         quirc_decode_error_t err = quirc_decode(&s_qr_code, &s_qr_data);
         if (err == QUIRC_SUCCESS) {
-            LOG("qr_scan: SUCCESS frame %d scale %dx v%d ecc=%d mask=%d dtype=%d len=%d",
+            LOG("qr_scan: SUCCESS frame %d scale %dx v%d ecc=%d mask=%d len=%d",
                 frame, scale, s_qr_data.version, s_qr_data.ecc_level,
-                s_qr_data.mask, s_qr_data.data_type, s_qr_data.payload_len);
+                s_qr_data.mask, s_qr_data.payload_len);
             return true;
         }
-        LOG("qr_scan: normal err '%s' (scale %dx)", quirc_strerror(err), scale);
+        LOG("qr_scan: err '%s' (scale %dx)", quirc_strerror(err), scale);
 
         quirc_flip(&s_qr_code);
         err = quirc_decode(&s_qr_code, &s_qr_data);
         if (err == QUIRC_SUCCESS) {
-            LOG("qr_scan: SUCCESS (flipped) frame %d scale %dx v%d ecc=%d mask=%d len=%d",
-                frame, scale, s_qr_data.version, s_qr_data.ecc_level,
-                s_qr_data.mask, s_qr_data.payload_len);
+            LOG("qr_scan: SUCCESS (flipped) frame %d scale %dx v%d len=%d",
+                frame, scale, s_qr_data.version, s_qr_data.payload_len);
             return true;
         }
         LOG("qr_scan: flipped err '%s' (scale %dx)", quirc_strerror(err), scale);
@@ -299,18 +292,28 @@ int qr_scan(char *out_buf, size_t out_len) {
             break;
         }
 
+        // ------ acquire frame ------
+        // CRITICAL ORDER: memcpy s_frame_buf BEFORE ui_cam_tex_upload.
+        // ui_cam_tex_upload calls C3D_TexFlush (GSPGPU_FlushDataCache on
+        // texture memory) which can disturb cache lines in the same linearAlloc
+        // pool as shared_buf, corrupting the data quirc would see.
+        svcWaitSynchronization(ctx->mutex, U64_MAX);
+        u32 cur_seq = ctx->frame_seq;
+        if (cur_seq != last_seq) {
+            // Invalidate CPU cache for shared_buf so we read fresh DMA data,
+            // then DSB to ensure the invalidation completes before memcpy.
+            GSPGPU_InvalidateDataCache(ctx->shared_buf, CAM_BUF_SZ);
+            __dsb();
+            memcpy(s_frame_buf, ctx->shared_buf, CAM_BUF_SZ);
+        }
+        // Now upload to GPU — after we have a clean copy in s_frame_buf
+        ui_cam_tex_upload(ctx->shared_buf, CAM_WIDTH, CAM_HEIGHT);
+        svcReleaseMutex(ctx->mutex);
+
         // ------ citro2d frame ------
         ui_frame_begin();
         ui_clear_target(ui_get_target(GFX_TOP),    COL_BLACK);
         ui_clear_target(ui_get_target(GFX_BOTTOM), COL_BG);
-
-        svcWaitSynchronization(ctx->mutex, U64_MAX);
-        u32 cur_seq = ctx->frame_seq;
-        GSPGPU_InvalidateDataCache(ctx->shared_buf, CAM_BUF_SZ);
-        ui_cam_tex_upload(ctx->shared_buf, CAM_WIDTH, CAM_HEIGHT);
-        if (cur_seq != last_seq)
-            memcpy(s_frame_buf, ctx->shared_buf, CAM_BUF_SZ);
-        svcReleaseMutex(ctx->mutex);
 
         ui_target(GFX_TOP);
         ui_cam_tex_draw(0.0f, 0.0f, (float)SCREEN_TOP_W, (float)SCREEN_H);
@@ -335,7 +338,7 @@ int qr_scan(char *out_buf, size_t out_len) {
         ui_hline(0, SCREEN_H - 1.0f, SCREEN_BOT_W, COL_LINE1);
 
         ui_frame_end();
-        // ------ end frame ------
+        // ------ end citro2d frame ------
 
         if (cur_seq == last_seq) continue;
         last_seq = cur_seq;
