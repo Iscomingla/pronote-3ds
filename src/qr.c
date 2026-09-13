@@ -20,17 +20,16 @@
  *              Dropped unsharp, added 1x full-res path.
  *   Session 6: Version rock-solid v13. DATA_ECC every frame.
  *              Added corner logging to rule out unstable perspective.
- *   Session 7: Corners stable. DATA_ECC root cause identified:
- *              CAMU outputs RGB565 big-endian; ARM reads u16 little-endian
- *              -> bytes swapped -> wrong channel extraction -> garbage luma.
- *              Fix: __builtin_bswap16 in rgb565_luma().
- *              Also added Otsu binarisation -- WRONG, broke detection.
- *   Session 8: QR no longer detected at all with Otsu.
- *              Root cause: quirc's region-growing in identify.c needs
- *              continuous greyscale for its own internal adaptive threshold.
- *              Pre-binarising to {0,255} defeats finder pattern detection.
- *              Fix: remove Otsu, keep only the byteswap.
- *   Session 9: Ported to fix/camera-preview-decode-stack (static buffers).
+ *   Session 7: Corners stable. DATA_ECC root cause: bswap added based on
+ *              wrong assumption about CAMU endianness.
+ *   Session 8: QR no longer detected at all — bswap was making luma wrong
+ *              while the GPU rendered fine without it (GPU_RGB565 expects
+ *              the same byte order CAMU produces). Removed bswap.
+ *   Session 10: No detection. Root cause confirmed: ui_cam_tex_upload reads
+ *               raw pixels without bswap and display is correct, so raw
+ *               bytes are already correct for ARM u16 reads. Bswap in
+ *               rgb565_luma was producing garbage luma -> quirc sees noise
+ *               -> zero candidates. Fix: remove bswap from rgb565_luma.
  *
  * Static buffer layout (BSS, not stack):
  *   s_frame_buf  -- 192000 B  u16[400*240]
@@ -172,17 +171,18 @@ static struct quirc_code s_qr_code;
 static struct quirc_data s_qr_data;
 
 // ---------------------------------------------------------------------------
-// rgb565_luma: byteswap then luminance.
+// rgb565_luma: extract luminance from a raw RGB565 u16.
 //
-// CAMU outputs RGB565 big-endian (high byte first in DMA memory).
-// ARM reads u16 little-endian, so the bytes are swapped on arrival.
-// After __builtin_bswap16: bits[15:11]=R, bits[10:5]=G, bits[4:0]=B.
+// CAMU OUTPUT_RGB_565 produces pixels that the ARM CPU reads correctly as
+// little-endian u16: bits[15:11]=R, bits[10:5]=G, bits[4:0]=B.
+// ui_cam_tex_upload confirms this — it passes pixels straight to GPU_RGB565
+// without any byteswap and the preview looks correct.
+// Therefore NO byteswap is needed here.
 //
 // Do NOT pre-binarise before feeding to quirc — quirc's region-growing
 // needs continuous greyscale for its internal adaptive threshold.
 // ---------------------------------------------------------------------------
-static inline u8 rgb565_luma(u16 raw) {
-    u16 px = __builtin_bswap16(raw);
+static inline u8 rgb565_luma(u16 px) {
     u32 r8 = ((px >> 11) & 0x1F) << 3;
     u32 g8 = ((px >>  5) & 0x3F) << 2;
     u32 b8 =  (px        & 0x1F) << 3;
