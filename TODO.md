@@ -4,7 +4,7 @@ Planned features, roughly in implementation order.
 
 ## 🔐 Authentication
 
-- [x] **PIN decryption of jeton** — decrypt the jeton from the QR code using the 4-digit PIN (AES-CBC, key = MD5(pin), IV = all zeroes — see PRONOTE protocol)
+- [ ] **PIN decryption of jeton** — decrypt the jeton from `user.json` using the 4-digit PIN (AES-CBC, key = MD5(pin), IV = all zeroes — see PRONOTE protocol)
 - [ ] **HTTP login request** — send decrypted credentials to the Pronote API endpoint
 - [ ] **Session persistence** — save session cookie to SD card so re-login isn't needed every time
 - [ ] **Secure credential storage** — encrypt saved credentials at rest
@@ -27,7 +27,7 @@ Planned features, roughly in implementation order.
 ## 🖥️ UI
 
 - [x] **Switch to citro2d/citro3d** — `ui.c`/`ui.h` layer wrapping C2D/C3D; GPU-accelerated, dual-screen, system font
-- [ ] **Camera preview in QR scanner** — blit camera frames to a GPU texture + draw crosshair in `qr.c` (skipped for now; requires C3D texture upload while camera DMA is active)
+- [ ] **In-app QR scanner** — camera-based QR scanning is blocked by a hard-to-reproduce data abort during capture; deferred. Current workaround: `sdmc:/3ds/notApro/user.json` (see README)
 - [ ] **Dual-screen layout** — data on top screen, nav/controls on bottom (login screen already uses dual-screen)
 - [ ] **Scrollable output** — scroll through content longer than one screen
 - [ ] **Loading screen** — progress bar during network requests
