@@ -9,26 +9,27 @@
  *   Camera thread: CAMU DMA loop -- captures frames into shared_buf
  *                  (linearAlloc) protected by a mutex + frame_seq counter.
  *
- * Decode history (sessions 1-6 preserved above, session 7 below):
+ * Decode history:
  *
- *   Session 7: Corners stable (v13, size=69, same coords every frame).
- *              DATA_ECC persists despite stable geometry.
- *
- *              Root cause: CAMU outputs RGB565 big-endian per pixel.
- *              ARM reads u16 little-endian, so the two bytes of each pixel
- *              are swapped: what we read as bits[15:11]=R is actually bits[7:3]
- *              of the second byte (part of G), and so on. rgb565_luma() was
- *              computing luminance from the wrong channels entirely, producing
- *              a noisy greyscale that quirc couldn't threshold correctly.
- *
- *              Fix 1: byteswap each u16 before extracting channels.
- *
- *              Fix 2: Otsu global threshold on the greyscale before quirc.
- *              quirc's internal adaptive threshold is tuned for scanned
- *              documents; the 3DS camera's tone mapping causes the histogram
- *              to cluster in a way that defeats it. Otsu's method finds the
- *              optimal single threshold to separate dark modules from light
- *              ones and produces a clean binary image for the decoder.
+ *   Session 1: DATA_ECC at 2x.
+ *   Session 2: Mutex held during processing -> DMA cascade.
+ *   Session 3: Version v13/v14/v15 jumps -> unsharp added.
+ *   Session 4: shared_buf calloc -> stale CPU cache -> torn frames. Fixed
+ *              with linearAlloc + __dsb() + InvalidateDataCache.
+ *   Session 5: DATA_ECC persists. Unsharp creates module-edge halos.
+ *              Dropped unsharp, added 1x full-res path.
+ *   Session 6: Version rock-solid v13. DATA_ECC every frame.
+ *              Added corner logging to rule out unstable perspective.
+ *   Session 7: Corners stable. DATA_ECC root cause identified:
+ *              CAMU outputs RGB565 big-endian; ARM reads u16 little-endian
+ *              -> bytes swapped -> wrong channel extraction -> garbage luma.
+ *              Fix: __builtin_bswap16 in rgb565_luma().
+ *              Also added Otsu binarisation -- WRONG, broke detection.
+ *   Session 8: QR no longer detected at all with Otsu.
+ *              Root cause: quirc's region-growing in identify.c needs
+ *              continuous greyscale for its own internal adaptive threshold.
+ *              Pre-binarising to {0,255} defeats finder pattern detection.
+ *              Fix: remove Otsu, keep only the byteswap.
  *
  * Static buffer layout (BSS, not stack):
  *   s_frame_buf  -- 192000 B  u16[400*240]
@@ -171,19 +172,23 @@ static struct quirc_code s_qr_code;
 static struct quirc_data s_qr_data;
 
 // ---------------------------------------------------------------------------
-// rgb565_luma: byteswap then luminance
+// rgb565_luma: byteswap then luminance.
 //
-// CAMU outputs RGB565 big-endian (high byte first in memory).
-// ARM reads u16 little-endian, so the bytes are swapped.
+// CAMU outputs RGB565 big-endian (high byte first in DMA memory).
+// ARM reads u16 little-endian, so the bytes are swapped on arrival.
 //
-// Raw u16 from buffer (little-endian read of big-endian bytes):
-//   bits[15:8] = second byte = G[2:0] B[4:0]
-//   bits[ 7:0] = first byte  = R[4:0] G[5:3]
+// Raw u16 as read by ARM (little-endian read of big-endian bytes):
+//   bits[15:8] = second DMA byte = G[2:0] B[4:0]
+//   bits[ 7:0] = first  DMA byte = R[4:0] G[5:3]
 //
 // After __builtin_bswap16:
 //   bits[15:11] = R[4:0]
-//   bits[10:5]  = G[5:0]
-//   bits[ 4:0]  = B[4:0]
+//   bits[10: 5] = G[5:0]
+//   bits[ 4: 0] = B[4:0]
+//
+// Note: do NOT pre-binarise before feeding to quirc. quirc's region-growing
+// (identify.c) needs a continuous greyscale for its internal adaptive
+// threshold. Pre-binarising to {0,255} breaks finder pattern detection.
 // ---------------------------------------------------------------------------
 static inline u8 rgb565_luma(u16 raw) {
     u16 px = __builtin_bswap16(raw);
@@ -194,58 +199,10 @@ static inline u8 rgb565_luma(u16 raw) {
 }
 
 // ---------------------------------------------------------------------------
-// otsu_threshold: compute optimal global binary threshold (Otsu's method)
-// Runs on a u8 greyscale buffer of n pixels.
-// Returns the threshold t such that pixels <= t are "dark" (module).
+// try_decode: feed greyscale buffer to quirc and attempt decode + flip
 // ---------------------------------------------------------------------------
-static u8 otsu_threshold(const u8 *buf, int n) {
-    u32 hist[256] = {0};
-    for (int i = 0; i < n; i++) hist[buf[i]]++;
-
-    u64 total = 0;
-    for (int i = 0; i < 256; i++) total += (u64)i * hist[i];
-
-    u64 sum_b = 0;
-    u32 w_b   = 0;
-    double best_var = 0.0;
-    u8 threshold = 128;
-
-    for (int t = 0; t < 256; t++) {
-        w_b += hist[t];
-        if (!w_b) continue;
-        u32 w_f = (u32)n - w_b;
-        if (!w_f) break;
-
-        sum_b += (u64)t * hist[t];
-        double mean_b = (double)sum_b / w_b;
-        double mean_f = ((double)total - (double)sum_b) / w_f;
-        double var = (double)w_b * (double)w_f * (mean_b - mean_f) * (mean_b - mean_f);
-
-        if (var > best_var) {
-            best_var  = var;
-            threshold = (u8)t;
-        }
-    }
-    return threshold;
-}
-
-// ---------------------------------------------------------------------------
-// apply_otsu: binarise buf in-place using Otsu threshold
-// ---------------------------------------------------------------------------
-static void apply_otsu(u8 *buf, int n) {
-    u8 t = otsu_threshold(buf, n);
-    for (int i = 0; i < n; i++)
-        buf[i] = (buf[i] <= t) ? 0 : 255;
-}
-
-// ---------------------------------------------------------------------------
-// try_decode
-// ---------------------------------------------------------------------------
-static bool try_decode(struct quirc *qrc, u8 *buf, int w, int h,
+static bool try_decode(struct quirc *qrc, const u8 *buf, int w, int h,
                        int frame, int scale) {
-    // Binarise before feeding to quirc
-    apply_otsu(buf, w * h);
-
     int qw = 0, qh = 0;
     uint8_t *qimg = quirc_begin(qrc, &qw, &qh);
     memcpy(qimg, buf, (size_t)qw * qh);
@@ -314,8 +271,7 @@ int qr_scan(char *out_buf, size_t out_len) {
     struct quirc *qrc1 = quirc_new();
     if (!qrc1 || quirc_resize(qrc1, CAM_WIDTH, CAM_HEIGHT) < 0) {
         if (qrc1) quirc_destroy(qrc1);
-        svcCloseHandle(ctx->cancel_event);
-        svcCloseHandle(ctx->mutex);
+        svcCloseHandle(ctx->cancel_event); svcCloseHandle(ctx->mutex);
         linearFree(ctx->shared_buf); free(ctx);
         return QR_ERROR;
     }
@@ -324,8 +280,7 @@ int qr_scan(char *out_buf, size_t out_len) {
     if (!qrc2 || quirc_resize(qrc2, W2, H2) < 0) {
         if (qrc2) quirc_destroy(qrc2);
         quirc_destroy(qrc1);
-        svcCloseHandle(ctx->cancel_event);
-        svcCloseHandle(ctx->mutex);
+        svcCloseHandle(ctx->cancel_event); svcCloseHandle(ctx->mutex);
         linearFree(ctx->shared_buf); free(ctx);
         return QR_ERROR;
     }
@@ -394,14 +349,14 @@ int qr_scan(char *out_buf, size_t out_len) {
         if (cur_seq == last_seq) continue;
         last_seq = cur_seq;
 
-        // 1x full-res
+        // 1x full-res greyscale
         for (int i = 0; i < CAM_WIDTH * CAM_HEIGHT; i++)
             s_grey1[i] = rgb565_luma(s_frame_buf[i]);
 
         if (try_decode(qrc1, s_grey1, CAM_WIDTH, CAM_HEIGHT, frames, 1))
             goto success;
 
-        // 2x downsampled fallback (2x2 average)
+        // 2x downsampled fallback (2x2 box average)
         for (int qy = 0; qy < H2; qy++) {
             for (int qx = 0; qx < W2; qx++) {
                 u32 sum = 0;
