@@ -1,6 +1,13 @@
 /*
- * aes.h -- AES-128 single-header implementation (public domain, B. Gladman style)
+ * aes.h -- AES-128 single-header implementation (public domain)
  * Supports ECB block decrypt only. CBC is built on top in crypto.c.
+ *
+ * Bug fix (2026-09-14):
+ *   The key schedule XOR loop was reading from rk[r-1] (previous row) when
+ *   it should read from rk[r] (current row being built). Words 1-3 of each
+ *   round key are: rk[r][i] = rk[r-1][i] ^ rk[r][i-4], not rk[r-1][i-4].
+ *   The old code: q[i] = p[i] ^ q[i-4]  (p=rk[r-1], wrong)
+ *   Fixed code:   q[i] = rk[r-1][i] ^ q[i-4]  (explicit previous row ref)
  */
 #ifndef AES128_H
 #define AES128_H
@@ -52,15 +59,11 @@ static inline uint8_t aes_mul(uint8_t a, uint8_t b){
     return r;
 }
 
-/* Rotate a 4-byte word left by one byte */
 static inline void aes_inv_shift_rows(uint8_t s[16]){
     uint8_t tmp;
-    /* row 1: right shift by 1 */
     tmp=s[13]; s[13]=s[9]; s[9]=s[5]; s[5]=s[1]; s[1]=tmp;
-    /* row 2: right shift by 2 (swap pairs) */
     tmp=s[2];  s[2]=s[10]; s[10]=tmp;
     tmp=s[6];  s[6]=s[14]; s[14]=tmp;
-    /* row 3: right shift by 3 = left shift by 1 */
     tmp=s[3];  s[3]=s[15]; s[15]=s[11]; s[11]=s[7]; s[7]=tmp;
 }
 
@@ -77,17 +80,18 @@ typedef struct { uint8_t rk[11][16]; } AES128_CTX;
 static void aes128_init(AES128_CTX *ctx, const uint8_t key[16]){
     memcpy(ctx->rk[0], key, 16);
     for(int r=1; r<=10; r++){
-        uint8_t *p = ctx->rk[r-1];
-        uint8_t *q = ctx->rk[r];
-        /* RotWord + SubWord + Rcon on last word of previous round key */
-        uint8_t tw[4] = {
-            (uint8_t)(aes_sbox[p[13]] ^ aes_rcon[r]),
-            aes_sbox[p[14]],
-            aes_sbox[p[15]],
-            aes_sbox[p[12]]
-        };
-        for(int i=0;  i<4;  i++) q[i]  = p[i]  ^ tw[i];
-        for(int i=4;  i<16; i++) q[i]  = p[i]  ^ q[i-4];
+        uint8_t *prev = ctx->rk[r-1];
+        uint8_t *cur  = ctx->rk[r];
+
+        /* RotWord(prev[12..15]) + SubWord + XOR Rcon -> first word of cur */
+        cur[0] = prev[0]  ^ aes_sbox[prev[13]] ^ aes_rcon[r];
+        cur[1] = prev[1]  ^ aes_sbox[prev[14]];
+        cur[2] = prev[2]  ^ aes_sbox[prev[15]];
+        cur[3] = prev[3]  ^ aes_sbox[prev[12]];
+
+        /* Words 1-3: cur[i] = prev[i] ^ cur[i-4] */
+        for(int i = 4; i < 16; i++)
+            cur[i] = prev[i] ^ cur[i-4];
     }
 }
 
@@ -96,10 +100,8 @@ static void aes128_decrypt_block(const AES128_CTX *ctx, uint8_t blk[16]){
     uint8_t s[16];
     int i, r;
 
-    /* Initial AddRoundKey (round 10) */
     for(i=0; i<16; i++) s[i] = blk[i] ^ ctx->rk[10][i];
 
-    /* Rounds 9 down to 1 */
     for(r=9; r>=1; r--){
         aes_inv_shift_rows(s);
         for(i=0; i<16; i++) s[i] = aes_isbox[s[i]];
@@ -107,7 +109,6 @@ static void aes128_decrypt_block(const AES128_CTX *ctx, uint8_t blk[16]){
         for(i=0; i<4;  i++) aes_inv_mix_col(s + i*4);
     }
 
-    /* Final round (no InvMixColumns) */
     aes_inv_shift_rows(s);
     for(i=0; i<16; i++) s[i] = aes_isbox[s[i]];
     for(i=0; i<16; i++) blk[i] = s[i] ^ ctx->rk[0][i];
