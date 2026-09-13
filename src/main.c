@@ -8,9 +8,9 @@
 
 #define USER_JSON_PATH  "sdmc:/3ds/notApro/user.json"
 
-#define MAX_USERNAME_LEN  64
-#define MAX_JETON_LEN    513
-#define MAX_PIN            5
+#define MAX_LOGIN_LEN    256  /* login field is 32-char hex, but allow room */
+#define MAX_JETON_LEN    513  /* jeton is up to 224 hex chars */
+#define MAX_PIN            5  /* 4 digits + null */
 
 #define HEADER_H    36.0f
 #define STRIPE1_Y   HEADER_H
@@ -28,13 +28,13 @@
 #define CTRL_DESC_X  64.0f
 
 typedef struct {
-    char  username[MAX_USERNAME_LEN];
-    char  jeton[MAX_JETON_LEN];
+    char  login[MAX_LOGIN_LEN];   /* "login" field from user.json */
+    char  jeton[MAX_JETON_LEN];   /* "jeton" field from user.json */
+    char  url[256];               /* "url" field from user.json */
     char  pin[MAX_PIN];
     char  uuid[37];
-    int   current_field;   /* 0: pin only — username/jeton come from file */
     int   logged_in;
-    int   user_loaded;     /* 1 if user.json was read successfully */
+    int   user_loaded;
     char  status_message[128];
     int   needs_redraw;
 } AppState;
@@ -50,50 +50,43 @@ static void safe_strncpy(char *dest, const char *src, size_t maxlen) {
 }
 
 /* ---------------------------------------------------------------------------
- * json_extract: pull the value of "key" from a JSON string.
- * Handles both "key":"value" (string) and "key":value (bare).
- * Returns 1 on success, 0 on failure.
+ * json_extract: pull the string value of "key" from a JSON object.
+ * Only handles quoted string values ("key":"value").
+ * Returns 1 on success, 0 if key not found or value not a quoted string.
  * --------------------------------------------------------------------------- */
 static int json_extract(const char *json, const char *key,
                         char *out, size_t out_len) {
-    char needle[64];
-    snprintf(needle, sizeof(needle), "\"%s\":", key);
+    /* Build search needle: "key":" */
+    char needle[72];
+    snprintf(needle, sizeof(needle), "\"%s\":\"", key);
     const char *p = strstr(json, needle);
     if (!p) return 0;
-    p += strlen(needle);
-    while (*p == ' ') p++;
+    p += strlen(needle);  /* p now points at first char of value */
 
-    if (*p == '"') {
-        /* quoted string */
-        p++;
-        const char *end = strchr(p, '"');
-        if (!end) return 0;
-        size_t n = (size_t)(end - p);
-        if (n >= out_len) n = out_len - 1;
-        memcpy(out, p, n);
-        out[n] = '\0';
-    } else {
-        /* bare value — read until , } or end */
-        const char *end = p;
-        while (*end && *end != ',' && *end != '}' && *end != '\n') end++;
-        size_t n = (size_t)(end - p);
-        if (n >= out_len) n = out_len - 1;
-        memcpy(out, p, n);
-        out[n] = '\0';
+    const char *end = p;
+    /* Walk until closing quote, handling simple \" escapes */
+    while (*end && *end != '"') {
+        if (*end == '\\' && *(end + 1)) end++;  /* skip escaped char */
+        end++;
     }
+    if (*end != '"') return 0;
+
+    size_t n = (size_t)(end - p);
+    if (n >= out_len) n = out_len - 1;
+    memcpy(out, p, n);
+    out[n] = '\0';
     return 1;
 }
 
 /* ---------------------------------------------------------------------------
- * load_user_json: read sdmc:/3ds/notApro/user.json and populate
- * app.username and app.jeton.
+ * load_user_json
  * --------------------------------------------------------------------------- */
 static void load_user_json(void) {
     FILE *f = fopen(USER_JSON_PATH, "r");
     if (!f) {
         LOG("user.json not found at %s", USER_JSON_PATH);
         safe_strncpy(app.status_message,
-                     "No user.json — see README",
+                     "No user.json - see README",
                      sizeof(app.status_message));
         return;
     }
@@ -117,20 +110,24 @@ static void load_user_json(void) {
     fclose(f);
     buf[rd] = '\0';
 
-    int ok_u = json_extract(buf, "login",  app.username, sizeof(app.username));
-    int ok_j = json_extract(buf, "jeton",  app.jeton,    sizeof(app.jeton));
+    LOG("user.json raw: %s", buf);
+
+    int ok_l = json_extract(buf, "login", app.login, sizeof(app.login));
+    int ok_j = json_extract(buf, "jeton", app.jeton, sizeof(app.jeton));
+    int ok_u = json_extract(buf, "url",   app.url,   sizeof(app.url));
     free(buf);
 
-    if (ok_u && ok_j) {
+    LOG("json_extract: login=%d jeton=%d url=%d", ok_l, ok_j, ok_u);
+
+    if (ok_l && ok_j) {
         app.user_loaded = 1;
-        LOG("user.json loaded: login=%s, jeton_len=%zu",
-            app.username, strlen(app.jeton));
+        LOG("loaded: login='%s' jeton_len=%zu url='%s'",
+            app.login, strlen(app.jeton), app.url);
         safe_strncpy(app.status_message,
-                     "Loaded — enter your PIN",
+                     "Loaded - enter your PIN",
                      sizeof(app.status_message));
     } else {
-        LOG("user.json missing 'login' or 'jeton' field (ok_u=%d ok_j=%d)",
-            ok_u, ok_j);
+        LOG("missing fields (ok_l=%d ok_j=%d)", ok_l, ok_j);
         safe_strncpy(app.status_message,
                      "user.json: missing login or jeton",
                      sizeof(app.status_message));
@@ -154,7 +151,7 @@ static void draw_field(float y, const char *label, const char *value,
         for (int i = 0; i < (int)strlen(value) && i < 4; i++)
             display[i] = '*';
     } else if (strlen(value) == 0) {
-        safe_strncpy(display, "\xe2\x80\x94", sizeof(display));
+        safe_strncpy(display, "(empty)", sizeof(display));
     } else if (strlen(value) > 24) {
         memcpy(display, value, 21);
         strcat(display, "...");
@@ -187,20 +184,17 @@ static void draw_login_screen(void) {
 
     float fy = CONTENT_Y;
 
-    /* Username — read-only, from file */
-    const char *user_label = app.user_loaded ? "Username (from user.json)"
-                                             : "Username (no user.json)";
-    draw_field(fy, user_label, app.username, 0, 0);
+    const char *login_label = app.user_loaded
+                              ? "Login (from user.json)"
+                              : "Login (no user.json found)";
+    draw_field(fy, login_label, app.login, 0, 0);
     fy += FIELD_H + FIELD_GAP;
 
-    /* Jeton — read-only, from file */
-    const char *jeton_val = strlen(app.jeton) > 0 ? "Loaded \xe2\x9c\x93"
-                                                   : "Missing";
+    const char *jeton_val = strlen(app.jeton) > 0 ? "OK" : "(empty)";
     draw_field(fy, "Jeton (from user.json)", jeton_val, 0, 0);
     fy += FIELD_H + FIELD_GAP;
 
-    /* PIN — the only interactive field */
-    draw_field(fy, "PIN code (4 digits)  [A: enter]", app.pin, 1, 1);
+    draw_field(fy, "PIN (4 digits)  [A: enter]", app.pin, 1, 1);
 
     /* Status bar */
     ui_rect(0, STATUS_Y, SCREEN_TOP_W, STATUS_H,
@@ -266,17 +260,13 @@ int main(int argc, char *argv[]) {
     safe_strncpy(app.uuid, "3DS-Pronote-Device", sizeof(app.uuid));
     app.needs_redraw = 1;
 
-    /* Load credentials from SD card on startup */
     load_user_json();
 
     while (aptMainLoop()) {
         hidScanInput();
         u32 kdown = hidKeysDown();
 
-        if (kdown & KEY_START) {
-            LOG("exit requested");
-            break;
-        }
+        if (kdown & KEY_START) { LOG("exit requested"); break; }
 
         if (kdown & KEY_A) {
             open_pin_keyboard();
@@ -290,17 +280,17 @@ int main(int argc, char *argv[]) {
         if (kdown & KEY_X) {
             if (!app.user_loaded) {
                 safe_strncpy(app.status_message,
-                             "No user.json — see README",
+                             "No user.json - see README",
                              sizeof(app.status_message));
                 LOG("login attempt: no user.json");
             } else if (strlen(app.pin) != 4) {
                 safe_strncpy(app.status_message,
                              "PIN must be 4 digits!",
                              sizeof(app.status_message));
-                LOG("login attempt: PIN length %zu", strlen(app.pin));
+                LOG("login attempt: bad PIN len %zu", strlen(app.pin));
             } else {
-                LOG("login attempt: user=%s, jeton_len=%zu",
-                    app.username, strlen(app.jeton));
+                LOG("login attempt: login=%s jeton_len=%zu",
+                    app.login, strlen(app.jeton));
                 safe_strncpy(app.status_message,
                              "Decrypting... (coming soon)",
                              sizeof(app.status_message));
