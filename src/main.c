@@ -8,11 +8,14 @@
 #include "log.h"
 
 #define USER_JSON_PATH  "sdmc:/3ds/notApro/user.json"
+#define TOKEN_PATH      "sdmc:/3ds/notApro/token.txt"
 
 #define MAX_LOGIN_LEN    256
 #define MAX_JETON_LEN    513
 #define MAX_PIN            5
 #define MAX_PLAIN_LEN    513
+#define MAX_TOKEN_LEN    513
+#define UUID_LEN          37
 
 #define HEADER_H    36.0f
 #define STRIPE1_Y   HEADER_H
@@ -30,11 +33,12 @@
 #define CTRL_DESC_X  64.0f
 
 typedef struct {
-    char  login[MAX_LOGIN_LEN];
-    char  jeton[MAX_JETON_LEN];
-    char  url[256];
-    char  pin[MAX_PIN];
-    char  uuid[37];
+    char  login[MAX_LOGIN_LEN];   /* encrypted hex from QR */
+    char  jeton[MAX_JETON_LEN];   /* encrypted hex from QR */
+    char  url[256];               /* school pronote URL */
+    char  pin[MAX_PIN];           /* 4-digit PIN */
+    char  uuid[UUID_LEN];         /* stable device UUID */
+    char  token[MAX_TOKEN_LEN];   /* saved jetonConnexionAppliMobile */
     int   logged_in;
     int   user_loaded;
     char  status_message[128];
@@ -71,6 +75,20 @@ static int json_extract(const char *json, const char *key,
     return 1;
 }
 
+/* Simple UUID v4 generator using sysclock entropy */
+static void generate_uuid(char *buf, size_t buf_sz) {
+    if (buf_sz < UUID_LEN) return;
+    u64 t1 = svcGetSystemTick();
+    u64 t2 = t1 ^ (t1 >> 17) ^ (t1 << 3);
+    snprintf(buf, buf_sz,
+        "%08llx-%04llx-4%03llx-%04llx-%012llx",
+        (unsigned long long)(t1 & 0xFFFFFFFF),
+        (unsigned long long)((t1 >> 32) & 0xFFFF),
+        (unsigned long long)((t2 >> 16) & 0xFFF),
+        (unsigned long long)((t2 & 0x3FFF) | 0x8000),
+        (unsigned long long)(t1 ^ t2));
+}
+
 static void load_user_json(void) {
     FILE *f = fopen(USER_JSON_PATH, "r");
     if (!f) {
@@ -105,8 +123,6 @@ static void load_user_json(void) {
     int ok_u = json_extract(buf, "url",   app.url,   sizeof(app.url));
     free(buf);
 
-    LOG("json_extract: login=%d jeton=%d url=%d", ok_l, ok_j, ok_u);
-
     if (ok_l && ok_j) {
         app.user_loaded = 1;
         LOG("loaded: login='%s' jeton_len=%zu url='%s'",
@@ -114,10 +130,24 @@ static void load_user_json(void) {
         safe_strncpy(app.status_message, "Loaded - enter your PIN",
                      sizeof(app.status_message));
     } else {
-        LOG("missing fields (ok_l=%d ok_j=%d)", ok_l, ok_j);
+        LOG("missing fields (ok_l=%d ok_j=%d ok_u=%d)", ok_l, ok_j, ok_u);
         safe_strncpy(app.status_message, "user.json: missing login or jeton",
                      sizeof(app.status_message));
     }
+
+    (void)ok_u;
+}
+
+/* Save token to SD for reuse on next boot */
+static void save_token(const char *token) {
+    /* Ensure dir exists */
+    mkdir("sdmc:/3ds", 0777);
+    mkdir("sdmc:/3ds/notApro", 0777);
+    FILE *f = fopen(TOKEN_PATH, "w");
+    if (!f) { LOG("save_token: cannot write %s", TOKEN_PATH); return; }
+    fprintf(f, "{\"token\":\"%s\"}\n", token);
+    fclose(f);
+    LOG("token saved to %s", TOKEN_PATH);
 }
 
 static void draw_field(float y, const char *label, const char *value,
@@ -222,47 +252,60 @@ static void do_login(void) {
     if (!app.user_loaded) {
         safe_strncpy(app.status_message, "No user.json - see README",
                      sizeof(app.status_message));
-        LOG("login: no user.json");
         return;
     }
     if (strlen(app.pin) != 4) {
         safe_strncpy(app.status_message, "PIN must be 4 digits!",
                      sizeof(app.status_message));
-        LOG("login: bad PIN len %zu", strlen(app.pin));
         return;
     }
 
-    LOG("login: decrypting login='%s' jeton_len=%zu",
-        app.login, strlen(app.jeton));
-
-    safe_strncpy(app.status_message, "Decrypting...",
-                 sizeof(app.status_message));
+    /* --- Decrypt credentials ------------------------------------------- */
+    safe_strncpy(app.status_message, "Decrypting...", sizeof(app.status_message));
     draw_login_screen();
 
-    /* Decrypt login field -> Pronote username */
     char plain_login[MAX_PLAIN_LEN] = {0};
     if (pronote_decrypt(app.login, app.pin, plain_login, sizeof(plain_login)) != 0) {
-        LOG("login: login field decrypt failed");
         safe_strncpy(app.status_message, "Decryption failed - wrong PIN?",
                      sizeof(app.status_message));
         return;
     }
-    LOG("login: plain_login='%s'", plain_login);
+    LOG("plain_login='%s'", plain_login);
 
-    /* Decrypt jeton field -> Pronote password */
     char plain_jeton[MAX_PLAIN_LEN] = {0};
     if (pronote_decrypt(app.jeton, app.pin, plain_jeton, sizeof(plain_jeton)) != 0) {
-        LOG("login: jeton field decrypt failed");
         safe_strncpy(app.status_message, "Decryption failed - wrong PIN?",
                      sizeof(app.status_message));
         return;
     }
-    LOG("login: plain_jeton='%s'", plain_jeton);
+    LOG("plain_jeton obtained (len=%zu)", strlen(plain_jeton));
 
-    /* TODO: HTTP login with plain_login + plain_jeton + app.url */
-    safe_strncpy(app.status_message, "Decrypted! (HTTP login coming soon)",
-                 sizeof(app.status_message));
-    app.logged_in = 1;
+    /* --- HTTP login ------------------------------------------------------- */
+    safe_strncpy(app.status_message, "Connecting...", sizeof(app.status_message));
+    draw_login_screen();
+
+    char new_token[MAX_TOKEN_LEN] = {0};
+    int result = pronote_login(
+        app.url,
+        plain_login,
+        plain_jeton,
+        app.uuid,
+        new_token,
+        sizeof(new_token)
+    );
+
+    if (result == 0) {
+        safe_strncpy(app.token, new_token, sizeof(app.token));
+        save_token(new_token);
+        safe_strncpy(app.status_message, "Logged in!", sizeof(app.status_message));
+        LOG("login OK, token saved");
+        app.logged_in = 1;
+    } else {
+        char err[64];
+        snprintf(err, sizeof(err), "Login failed (err %d)", result);
+        safe_strncpy(app.status_message, err, sizeof(app.status_message));
+        LOG("login failed: %d", result);
+    }
 }
 
 int main(int argc, char *argv[]) {
@@ -275,7 +318,8 @@ int main(int argc, char *argv[]) {
     LOG("notApro started");
 
     memset(&app, 0, sizeof(AppState));
-    safe_strncpy(app.uuid, "3DS-Pronote-Device", sizeof(app.uuid));
+    generate_uuid(app.uuid, sizeof(app.uuid));
+    LOG("uuid=%s", app.uuid);
     app.needs_redraw = 1;
 
     load_user_json();
