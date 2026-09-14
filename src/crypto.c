@@ -1,19 +1,25 @@
 /*
- * crypto.c -- Pronote QR jeton decryption
+ * crypto.c -- Pronote QR jeton decryption [build 3]
+ *
+ * NOTE: if decryption gives wrong results after pulling, run:
+ *   make clean && make
+ * The aes.h header-only lib doesn't trigger crypto.o recompilation
+ * automatically when only the header changes.
  *
  * Protocol (from pronotepy/PRONOTE protocol.md, QR code login section):
  *
  *   key = MD5(pin)          -- MD5 of the 4-digit PIN string, e.g. "1234"
- *   iv  = 16 zero bytes     -- NOT MD5(login); the login field is the
- *                              decrypted username, not an IV source
- *   ct  = hex_decode(jeton) -- jeton and login are both AES-128-CBC
- *                              ciphertexts from the QR JSON
+ *   iv  = 16 zero bytes     -- NOT MD5(login)
+ *   ct  = hex_decode(jeton)
  *   pt  = AES-128-CBC-Decrypt(key, iv, ct)
  *   result = PKCS7-strip(pt)
  *
- * Both "login" and "jeton" fields in the QR JSON are encrypted with the
- * same key/iv. Decrypting "jeton" gives the Pronote password; decrypting
- * "login" gives the Pronote username.
+ * Both "login" and "jeton" in the QR JSON are encrypted with the same key/iv.
+ * Decrypting "jeton" -> Pronote password; "login" -> Pronote username.
+ *
+ * AES key schedule (fixed 2026-09-14):
+ *   Words 1-3 of each round key: cur[i] = prev[i] ^ cur[i-4]
+ *   The old bug read prev[i] ^ prev[i-4] (wrong — prev not cur for i-4).
  */
 
 #include "crypto.h"
@@ -22,6 +28,36 @@
 #include "../lib/crypto/aes.h"
 #include <stdlib.h>
 #include <string.h>
+
+/* Sanity-check the AES key schedule at runtime on the first call.
+ * MD5("1234") = 81dc9bdb52d04dc20036dbd8313ed055
+ * AES-128-ECB-Decrypt(key=81dc..., block=978BE8049DC9A20FF825653CE4D7039D)
+ * should give 44364337363142373542444532443134
+ * If it gives b3efbc0d... the old aes.h is still linked (stale build). */
+static void aes_self_test(void) {
+    static const uint8_t key[16] = {
+        0x81,0xdc,0x9b,0xdb,0x52,0xd0,0x4d,0xc2,
+        0x00,0x36,0xdb,0xd8,0x31,0x3e,0xd0,0x55
+    };
+    static const uint8_t ct[16] = {
+        0x97,0x8b,0xe8,0x04,0x9d,0xc9,0xa2,0x0f,
+        0xf8,0x25,0x65,0x3c,0xe4,0xd7,0x03,0x9d
+    };
+    static const uint8_t expected[16] = {
+        0x44,0x36,0x43,0x37,0x36,0x31,0x42,0x37,
+        0x35,0x42,0x44,0x45,0x32,0x44,0x31,0x34
+    };
+    uint8_t blk[16];
+    memcpy(blk, ct, 16);
+    AES128_CTX ctx;
+    aes128_init(&ctx, key);
+    aes128_decrypt_block(&ctx, blk);
+    if (memcmp(blk, expected, 16) == 0)
+        LOG("aes_self_test: PASS");
+    else
+        LOG("aes_self_test: FAIL got %02x%02x%02x%02x... (stale build? run make clean)",
+            blk[0], blk[1], blk[2], blk[3]);
+}
 
 static int hex_decode(const char *hex, uint8_t *out, size_t out_len) {
     size_t hlen = strlen(hex);
@@ -104,7 +140,8 @@ static int aes_cbc_decrypt(const uint8_t key[16], const uint8_t iv[16],
 
 int pronote_decrypt_jeton(const char *pin, const char *login,
                           const char *jeton, char *out, size_t out_max) {
-    /* key = MD5(pin) */
+    aes_self_test();
+
     uint8_t key[16];
     md5((const uint8_t *)pin, strlen(pin), key);
     LOG("crypto: key=%02x%02x%02x%02x%02x%02x%02x%02x"
@@ -112,17 +149,14 @@ int pronote_decrypt_jeton(const char *pin, const char *login,
         key[0],key[1],key[2],key[3],key[4],key[5],key[6],key[7],
         key[8],key[9],key[10],key[11],key[12],key[13],key[14],key[15]);
 
-    /* iv = 16 zero bytes (per PRONOTE protocol spec) */
     uint8_t iv[16] = {0};
 
-    /* Decrypt jeton -> password */
     LOG("crypto: decrypting jeton (len=%zu)", strlen(jeton));
     if (!aes_cbc_decrypt(key, iv, jeton, out, out_max)) {
         LOG("crypto: jeton decrypt failed"); return 0;
     }
     LOG("crypto: password='%s'", out);
 
-    /* Also decrypt login -> username (logged for info) */
     char username[128] = {0};
     if (aes_cbc_decrypt(key, iv, login, username, sizeof(username)))
         LOG("crypto: username='%s'", username);
