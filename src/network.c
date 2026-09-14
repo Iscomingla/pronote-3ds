@@ -96,14 +96,12 @@ static int hex_decode(const char *hex, uint8_t *out, size_t *out_n) {
     return 0;
 }
 
-/* pkcs7 pad buf in-place; buf must have room for up to 32 extra bytes */
 static size_t pkcs7_pad(uint8_t *buf, size_t data_len, size_t block) {
     uint8_t pad = (uint8_t)(block - data_len % block);
     for (size_t i = 0; i < pad; i++) buf[data_len+i] = pad;
     return data_len + pad;
 }
 
-/* AES-256-CBC encrypt. key=32B, iv=16B. in_len must be block-multiple. */
 static int aes256_cbc_enc(const uint8_t *key, const uint8_t *iv,
                            const uint8_t *in, size_t in_len,
                            uint8_t *out) {
@@ -117,7 +115,6 @@ static int aes256_cbc_enc(const uint8_t *key, const uint8_t *iv,
     return r;
 }
 
-/* AES-256-CBC decrypt */
 static int aes256_cbc_dec(const uint8_t *key, const uint8_t *iv,
                            const uint8_t *in, size_t in_len,
                            uint8_t *out) {
@@ -131,16 +128,13 @@ static int aes256_cbc_dec(const uint8_t *key, const uint8_t *iv,
     return r;
 }
 
-/* Derive default 32-byte key from MD5("") repeated to fill 256 bits */
 static void default_key(uint8_t key[32]) {
-    /* MD5("") = d41d8cd98f00b204e9800998ecf8427e (16 bytes) */
     uint8_t h[16];
     mbedtls_md5((const unsigned char *)"", 0, h);
     memcpy(key,    h, 16);
     memcpy(key+16, h, 16);
 }
 
-/* Encode counter to AES-256-CBC hex (numeroOrdre) */
 static int make_numero_ordre(int counter, const uint8_t *key,
                               const uint8_t *iv, char *out, size_t out_sz) {
     char counter_str[12];
@@ -168,7 +162,7 @@ static char *http_get(const char *url, int *status_out) {
     rc = httpcOpenContext(&ctx, HTTPC_METHOD_GET, url, 1);
     if (R_FAILED(rc)) { LOG("http_get: open failed 0x%08lX", rc); return NULL; }
 
-    httpcSetSSLOpt(&ctx, SSLCOPT_DisableVerify); /* dev only */
+    httpcSetSSLOpt(&ctx, SSLCOPT_DisableVerify);
     httpcSetKeepAlive(&ctx, HTTPC_KEEPALIVE_ENABLED);
     httpcAddRequestHeaderField(&ctx, "User-Agent",
         "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36");
@@ -207,7 +201,21 @@ static char *http_post_json(const char *url, const char *json,
     httpcAddRequestHeaderField(&ctx, "User-Agent",
         "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36");
     httpcAddRequestHeaderField(&ctx, "Content-Type", "application/json");
-    httpcAddPostDataRaw(&ctx, (const u8*)json, (u32)strlen(json));
+
+    /*
+     * httpcAddPostDataRaw expects const u32* — the data pointer must be
+     * 4-byte aligned. json is a stack/heap string, not guaranteed aligned,
+     * so copy into an aligned buffer first.
+     */
+    size_t json_len = strlen(json);
+    size_t aligned_sz = (json_len + 3) & ~(size_t)3;   /* round up to 4 */
+    u32 *aligned_buf = (u32 *)malloc(aligned_sz + 4);
+    if (aligned_buf) {
+        memset(aligned_buf, 0, aligned_sz + 4);
+        memcpy(aligned_buf, json, json_len);
+        httpcAddPostDataRaw(&ctx, aligned_buf, (u32)json_len);
+        free(aligned_buf);
+    }
 
     rc = httpcBeginRequest(&ctx);
     if (R_FAILED(rc)) { LOG("http_post: begin failed 0x%08lX", rc); goto out; }
@@ -230,10 +238,9 @@ out:
 }
 
 /* -------------------------------------------------------------------------
- * JSON helpers (minimal, no malloc)
+ * JSON helpers
  * ---------------------------------------------------------------------- */
 
-/* Extract first string value for "key":"value" */
 static int json_str(const char *json, const char *key,
                     char *out, size_t out_sz) {
     char needle[80];
@@ -249,37 +256,21 @@ static int json_str(const char *json, const char *key,
     return 1;
 }
 
-/* Extract first int value for "key":number */
-static int json_int(const char *json, const char *key, int *out) {
-    char needle[80];
-    snprintf(needle, sizeof(needle), "\"%s\":", key);
-    const char *p = strstr(json, needle);
-    if (!p) return 0;
-    p += strlen(needle);
-    while (*p == ' ') p++;
-    if (*p != '"') { *out = atoi(p); return 1; }
-    /* quoted int */
-    p++; *out = atoi(p); return 1;
-}
-
 /* -------------------------------------------------------------------------
- * Parse session HTML — extract onload params
+ * Parse session HTML
  * ---------------------------------------------------------------------- */
 
 static int parse_session_html(const char *html,
                                int *session_id, int *espace_id) {
-    /* onload="try { Start ({h:'2052117',sCrA:true,...,a:3,...}) }" */
     const char *p = strstr(html, "Start (");
     if (!p) p = strstr(html, "Start(");
     if (!p) { LOG("parse_session: no Start( found"); return -1; }
 
-    /* session id: h:'NNNN' */
     const char *h = strstr(p, "h:'");
     if (!h) { LOG("parse_session: no h:"); return -1; }
     h += 3;
     *session_id = atoi(h);
 
-    /* espace id: a:N */
     const char *a = strstr(p, ",a:");
     if (!a) { LOG("parse_session: no a:"); return -1; }
     a += 3;
@@ -289,17 +280,9 @@ static int parse_session_html(const char *html,
     return 0;
 }
 
-/* -------------------------------------------------------------------------
- * Build pronote root URL from mobile.eleve.html URL
- * ---------------------------------------------------------------------- */
-
 static void make_root_url(const char *url, char *root, size_t root_sz) {
-    /* https://host/pronote/mobile.eleve.html -> https://host/pronote/ */
     const char *last_slash = strrchr(url, '/');
-    if (!last_slash) {
-        snprintf(root, root_sz, "%s/", url);
-        return;
-    }
+    if (!last_slash) { snprintf(root, root_sz, "%s/", url); return; }
     size_t n = (size_t)(last_slash - url) + 1;
     if (n >= root_sz) n = root_sz-1;
     memcpy(root, url, n);
@@ -316,22 +299,15 @@ int pronote_login(const char *url,
                   const char *uuid,
                   char       *out_token,
                   size_t      out_token_sz) {
-    int rc = 0;
     char *resp = NULL;
-
-    /* --- derive root URL and login URL ---------------------------------- */
     char root[256], login_url[320], api_url[384];
     make_root_url(url, root, sizeof(root));
-    snprintf(login_url, sizeof(login_url), "%s?login=true",
-             /* strip mobile. prefix from filename for session init */
-             /* actually use the full url as-is, just append ?login=true */
-             url);
-
+    snprintf(login_url, sizeof(login_url), "%s?login=true", url);
     LOG("pronote_login: url=%s", url);
 
-    /* ===== Step 1: GET session HTML ===================================== */
     httpcInit(0);
 
+    /* ===== Step 1: GET session HTML ===================================== */
     int status = 0;
     resp = http_get(login_url, &status);
     if (!resp || status < 200 || status >= 300) {
@@ -345,16 +321,12 @@ int pronote_login(const char *url,
     }
     free(resp); resp = NULL;
 
-    /* Current AES state: default key (MD5("")*2) + zero IV */
     uint8_t cur_key[32], cur_iv[16];
     default_key(cur_key);
     memset(cur_iv, 0, 16);
 
-    /* ===== Step 2: FonctionParametres — send new IV ==================== */
-
-    /* Generate a random 16-byte IV and base64-encode it */
+    /* ===== Step 2: FonctionParametres =================================== */
     uint8_t new_iv[16];
-    svcGetSystemTick();  /* seed not needed, just using tick bytes */
     for (int i = 0; i < 16; i++)
         new_iv[i] = (uint8_t)(svcGetSystemTick() >> (i*3));
 
@@ -385,12 +357,9 @@ int pronote_login(const char *url,
     }
     LOG("step2 ok");
     free(resp); resp = NULL;
-
-    /* Switch to new IV for all subsequent requests */
     memcpy(cur_iv, new_iv, 16);
 
     /* ===== Step 3: Identification ======================================= */
-
     make_numero_ordre(3, cur_key, cur_iv, num_ordre, sizeof(num_ordre));
     snprintf(api_url, sizeof(api_url),
              "%sappelfonction/%d/%d/3", root, espace_id, session_id);
@@ -421,8 +390,7 @@ int pronote_login(const char *url,
     }
     LOG("step3 ok: %s", resp);
 
-    /* Extract alea and challenge from donneesSec.donnees */
-    char alea[256]      = {0};
+    char alea[256]       = {0};
     char challenge[1024] = {0};
     json_str(resp, "alea",      alea,      sizeof(alea));
     json_str(resp, "challenge", challenge, sizeof(challenge));
@@ -435,15 +403,6 @@ int pronote_login(const char *url,
     }
 
     /* ===== Step 4: Solve challenge ====================================== */
-    /*
-     * mtp = upper_hex(SHA256(alea + password))
-     * key = MD5(username + mtp)  [32 bytes = MD5*2]
-     * dec = AES256-CBC-decrypt(hex2bin(challenge), key, cur_iv)
-     * mod = every other char: "abcde" -> "ace"
-     * resp_enc = upper_hex(AES256-CBC-encrypt(padded(mod), key, cur_iv))
-     */
-
-    /* SHA256(alea + password) */
     char sha_input[600];
     snprintf(sha_input, sizeof(sha_input), "%s%s", alea, password);
     uint8_t sha256_out[32];
@@ -454,7 +413,6 @@ int pronote_login(const char *url,
     hex_encode(sha256_out, 32, mtp, sizeof(mtp));
     to_upper(mtp);
 
-    /* MD5(username + mtp) */
     char key_input[600];
     snprintf(key_input, sizeof(key_input), "%s%s", username, mtp);
     uint8_t chall_key_half[16];
@@ -464,7 +422,6 @@ int pronote_login(const char *url,
     memcpy(chall_key,    chall_key_half, 16);
     memcpy(chall_key+16, chall_key_half, 16);
 
-    /* Decrypt challenge */
     size_t ct_len = 0;
     uint8_t chall_ct[512];
     if (hex_decode(challenge, chall_ct, &ct_len) != 0 ||
@@ -477,13 +434,11 @@ int pronote_login(const char *url,
         LOG("solve: AES decrypt failed");
         httpcExit(); return -6;
     }
-    /* PKCS7 unpad */
     uint8_t pad = chall_pt[ct_len-1];
     size_t pt_len = (pad>0&&pad<=16) ? ct_len-pad : ct_len;
     chall_pt[pt_len] = '\0';
     LOG("solve: plaintext='%s'", (char*)chall_pt);
 
-    /* Strip every 2nd char: "abcde" -> "ace" */
     char modified[512];
     size_t mi = 0;
     for (size_t i = 0; i < pt_len; i += 2)
@@ -491,7 +446,6 @@ int pronote_login(const char *url,
     modified[mi] = '\0';
     LOG("solve: modified='%s'", modified);
 
-    /* Re-encrypt */
     uint8_t mod_padded[512];
     memcpy(mod_padded, modified, mi);
     size_t mod_padded_len = pkcs7_pad(mod_padded, mi, 16);
@@ -506,8 +460,7 @@ int pronote_login(const char *url,
     to_upper(solved);
     LOG("solve: response='%.40s...'", solved);
 
-    /* ===== Step 5: Authentification ==================================== */
-
+    /* ===== Step 5: Authentification ===================================== */
     make_numero_ordre(5, cur_key, cur_iv, num_ordre, sizeof(num_ordre));
     snprintf(api_url, sizeof(api_url),
              "%sappelfonction/%d/%d/5", root, espace_id, session_id);
@@ -530,7 +483,6 @@ int pronote_login(const char *url,
     }
     LOG("step5 ok: %.200s", resp);
 
-    /* Extract jetonConnexionAppliMobile */
     if (!json_str(resp, "jetonConnexionAppliMobile",
                   out_token, out_token_sz)) {
         LOG("step5: no jetonConnexionAppliMobile in response");
