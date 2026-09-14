@@ -4,20 +4,16 @@
 #include <string.h>
 #include "ui.h"
 #include "network.h"
-#include "qr.h"
+#include "crypto.h"
 #include "log.h"
 
-/*
- * The jeton is a hex-encoded AES-CBC ciphertext.
- * 512 chars gives comfortable headroom beyond any observed real-world value.
- */
-#define MAX_USERNAME_LEN  64
-#define MAX_JETON_LEN    513   /* 512 usable chars + null */
-#define MAX_PIN            5   /* 4 digits + null */
+#define USER_JSON_PATH  "sdmc:/3ds/notApro/user.json"
 
-/* ---------------------------------------------------------------------------
- * Layout constants
- * --------------------------------------------------------------------------- */
+#define MAX_LOGIN_LEN    256
+#define MAX_JETON_LEN    513
+#define MAX_PIN            5
+#define MAX_PLAIN_LEN    513
+
 #define HEADER_H    36.0f
 #define STRIPE1_Y   HEADER_H
 #define STRIPE1_H    4.0f
@@ -30,25 +26,19 @@
 #define FIELD_W     (SCREEN_TOP_W - FIELD_X * 2.0f)
 #define STATUS_H    18.0f
 #define STATUS_Y    (SCREEN_H - STATUS_H)
-
 #define CTRL_KEY_X   12.0f
 #define CTRL_DESC_X  64.0f
 
-typedef enum {
-    SCREEN_LOGIN,
-    SCREEN_QR_SCAN,
-} Screen;
-
 typedef struct {
-    char   username[MAX_USERNAME_LEN];
-    char   jeton[MAX_JETON_LEN];
-    char   pin[MAX_PIN];
-    char   uuid[37];
-    int    current_field;
-    int    logged_in;
-    char   status_message[128];
-    int    needs_redraw;
-    Screen screen;
+    char  login[MAX_LOGIN_LEN];
+    char  jeton[MAX_JETON_LEN];
+    char  url[256];
+    char  pin[MAX_PIN];
+    char  uuid[37];
+    int   logged_in;
+    int   user_loaded;
+    char  status_message[128];
+    int   needs_redraw;
 } AppState;
 
 static AppState app;
@@ -59,6 +49,75 @@ static void safe_strncpy(char *dest, const char *src, size_t maxlen) {
     if (len >= maxlen) len = maxlen - 1;
     memcpy(dest, src, len);
     dest[len] = '\0';
+}
+
+static int json_extract(const char *json, const char *key,
+                        char *out, size_t out_len) {
+    char needle[72];
+    snprintf(needle, sizeof(needle), "\"%s\":\"", key);
+    const char *p = strstr(json, needle);
+    if (!p) return 0;
+    p += strlen(needle);
+    const char *end = p;
+    while (*end && *end != '"') {
+        if (*end == '\\' && *(end + 1)) end++;
+        end++;
+    }
+    if (*end != '"') return 0;
+    size_t n = (size_t)(end - p);
+    if (n >= out_len) n = out_len - 1;
+    memcpy(out, p, n);
+    out[n] = '\0';
+    return 1;
+}
+
+static void load_user_json(void) {
+    FILE *f = fopen(USER_JSON_PATH, "r");
+    if (!f) {
+        LOG("user.json not found at %s", USER_JSON_PATH);
+        safe_strncpy(app.status_message, "No user.json - see README",
+                     sizeof(app.status_message));
+        return;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    rewind(f);
+
+    if (sz <= 0 || sz > 4096) {
+        LOG("user.json size %ld out of range", sz);
+        fclose(f);
+        safe_strncpy(app.status_message, "user.json too large or empty",
+                     sizeof(app.status_message));
+        return;
+    }
+
+    char *buf = (char *)malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); return; }
+    size_t rd = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    buf[rd] = '\0';
+
+    LOG("user.json raw: %s", buf);
+
+    int ok_l = json_extract(buf, "login", app.login, sizeof(app.login));
+    int ok_j = json_extract(buf, "jeton", app.jeton, sizeof(app.jeton));
+    int ok_u = json_extract(buf, "url",   app.url,   sizeof(app.url));
+    free(buf);
+
+    LOG("json_extract: login=%d jeton=%d url=%d", ok_l, ok_j, ok_u);
+
+    if (ok_l && ok_j) {
+        app.user_loaded = 1;
+        LOG("loaded: login='%s' jeton_len=%zu url='%s'",
+            app.login, strlen(app.jeton), app.url);
+        safe_strncpy(app.status_message, "Loaded - enter your PIN",
+                     sizeof(app.status_message));
+    } else {
+        LOG("missing fields (ok_l=%d ok_j=%d)", ok_l, ok_j);
+        safe_strncpy(app.status_message, "user.json: missing login or jeton",
+                     sizeof(app.status_message));
+    }
 }
 
 static void draw_field(float y, const char *label, const char *value,
@@ -75,7 +134,7 @@ static void draw_field(float y, const char *label, const char *value,
         for (int i = 0; i < (int)strlen(value) && i < 4; i++)
             display[i] = '*';
     } else if (strlen(value) == 0) {
-        safe_strncpy(display, "\xe2\x80\x94", sizeof(display));
+        safe_strncpy(display, "(empty)", sizeof(display));
     } else if (strlen(value) > 24) {
         memcpy(display, value, 21);
         strcat(display, "...");
@@ -97,30 +156,24 @@ static void draw_login_screen(void) {
     ui_clear_target(ui_get_target(GFX_BOTTOM), COL_BG);
 
     ui_target(GFX_TOP);
-
     ui_rect(0, 0, SCREEN_TOP_W, HEADER_H, C2D_Color32(0x00, 0x60, 0x52, 0xFF));
     ui_text_centred(0, SCREEN_TOP_W, 8.0f, 0.65f, COL_WHITE, "notApro");
     ui_rect(0, STRIPE1_Y, SCREEN_TOP_W, STRIPE1_H, COL_LINE1);
     ui_rect(0, STRIPE2_Y, SCREEN_TOP_W, STRIPE2_H, COL_LINE2);
 
     float fy = CONTENT_Y;
-    char  lbl[80];
 
-    snprintf(lbl, sizeof(lbl), "Username%s",
-             app.current_field == 0 ? "  [A: edit]" : "");
-    draw_field(fy, lbl, app.username, 0, app.current_field == 0);
+    const char *login_label = app.user_loaded
+                              ? "Login (from user.json)"
+                              : "Login (no user.json found)";
+    draw_field(fy, login_label, app.login, 0, 0);
     fy += FIELD_H + FIELD_GAP;
 
-    snprintf(lbl, sizeof(lbl), "Pronote QR%s",
-             app.current_field == 1 ? "  [A: scan]" : "");
-    const char *qr_val = strlen(app.jeton) > 0
-                         ? "Scanned \xe2\x9c\x93" : "Not scanned";
-    draw_field(fy, lbl, qr_val, 0, app.current_field == 1);
+    const char *jeton_val = strlen(app.jeton) > 0 ? "OK" : "(empty)";
+    draw_field(fy, "Jeton (from user.json)", jeton_val, 0, 0);
     fy += FIELD_H + FIELD_GAP;
 
-    snprintf(lbl, sizeof(lbl), "PIN code (4 digits)%s",
-             app.current_field == 2 ? "  [A: enter]" : "");
-    draw_field(fy, lbl, app.pin, 1, app.current_field == 2);
+    draw_field(fy, "PIN (4 digits)  [A: enter]", app.pin, 1, 1);
 
     ui_rect(0, STATUS_Y, SCREEN_TOP_W, STATUS_H,
             C2D_Color32(0x00, 0x50, 0x40, 0xCC));
@@ -128,20 +181,17 @@ static void draw_login_screen(void) {
     ui_text(8.0f, STATUS_Y + 2.0f, 0.45f, COL_WHITE, app.status_message);
 
     ui_target(GFX_BOTTOM);
-
     ui_rect(0, 0, SCREEN_BOT_W, HEADER_H, C2D_Color32(0x00, 0x60, 0x52, 0xFF));
     ui_text_centred(0, SCREEN_BOT_W, 8.0f, 0.65f, COL_WHITE, "Controls");
     ui_hline(0, HEADER_H, SCREEN_BOT_W, COL_LINE1);
 
-    float cy  = HEADER_H + 10.0f;
-    float lsz = 0.50f;
-    float lg  = 18.0f;
-    const char *keys[]  = { "\xe2\x86\x91\xe2\x86\x93", "A", "Y", "X", "START" };
-    const char *descs[] = { "Navigate fields", "Edit / Scan QR",
-                            "Clear field", "Login", "Exit app" };
-    for (int i = 0; i < 5; i++) {
+    float cy = HEADER_H + 10.0f;
+    const float lsz = 0.50f, lg = 18.0f;
+    const char *keys[]  = { "A", "Y", "X", "START" };
+    const char *descs[] = { "Enter PIN", "Clear PIN", "Login", "Exit" };
+    for (int i = 0; i < 4; i++) {
         ui_text(CTRL_KEY_X,  cy, lsz, COL_LINE1, keys[i]);
-        ui_text(CTRL_DESC_X, cy, lsz, COL_WHITE, descs[i]);
+        ui_text(CTRL_DESC_X, cy, lsz, COL_WHITE,  descs[i]);
         cy += lg;
     }
     ui_hline(0, SCREEN_H - 3.0f, SCREEN_BOT_W, COL_LINE2);
@@ -150,41 +200,69 @@ static void draw_login_screen(void) {
     ui_frame_end();
 }
 
-static void open_keyboard(void) {
-    if (app.current_field == 1) {
-        LOG("QR scan triggered");
-        app.screen = SCREEN_QR_SCAN;
-        return;
-    }
-
+static void open_pin_keyboard(void) {
     SwkbdState swkbd;
-    char tmp[512] = {0};
+    char tmp[MAX_PIN] = {0};
+    safe_strncpy(tmp, app.pin, sizeof(tmp));
 
-    if (app.current_field == 0) {
-        swkbdInit(&swkbd, SWKBD_TYPE_NORMAL, 2, MAX_USERNAME_LEN - 1);
-        swkbdSetHintText(&swkbd, "Enter username from QR code");
-        safe_strncpy(tmp, app.username, sizeof(tmp));
-    } else {
-        swkbdInit(&swkbd, SWKBD_TYPE_NUMPAD, 1, 4);
-        swkbdSetPasswordMode(&swkbd, SWKBD_PASSWORD_HIDE_DELAY);
-        swkbdSetHintText(&swkbd, "Enter 4-digit PIN");
-        safe_strncpy(tmp, app.pin, sizeof(tmp));
-    }
-
-    if (tmp[0] != '\0')
-        swkbdSetInitialText(&swkbd, tmp);
+    swkbdInit(&swkbd, SWKBD_TYPE_NUMPAD, 1, 4);
+    swkbdSetPasswordMode(&swkbd, SWKBD_PASSWORD_HIDE_DELAY);
+    swkbdSetHintText(&swkbd, "Enter 4-digit PIN");
+    if (tmp[0] != '\0') swkbdSetInitialText(&swkbd, tmp);
 
     memset(tmp, 0, sizeof(tmp));
     if (swkbdInputText(&swkbd, tmp, sizeof(tmp)) == SWKBD_BUTTON_CONFIRM) {
-        if (app.current_field == 0) {
-            safe_strncpy(app.username, tmp, sizeof(app.username));
-            LOG("username set: %s", app.username);
-        } else {
-            safe_strncpy(app.pin, tmp, sizeof(app.pin));
-            LOG("PIN entered (%zu digits)", strlen(app.pin));
-        }
+        safe_strncpy(app.pin, tmp, sizeof(app.pin));
+        LOG("PIN entered (%zu digits)", strlen(app.pin));
         app.needs_redraw = 1;
     }
+}
+
+static void do_login(void) {
+    if (!app.user_loaded) {
+        safe_strncpy(app.status_message, "No user.json - see README",
+                     sizeof(app.status_message));
+        LOG("login: no user.json");
+        return;
+    }
+    if (strlen(app.pin) != 4) {
+        safe_strncpy(app.status_message, "PIN must be 4 digits!",
+                     sizeof(app.status_message));
+        LOG("login: bad PIN len %zu", strlen(app.pin));
+        return;
+    }
+
+    LOG("login: decrypting login='%s' jeton_len=%zu",
+        app.login, strlen(app.jeton));
+
+    safe_strncpy(app.status_message, "Decrypting...",
+                 sizeof(app.status_message));
+    draw_login_screen();
+
+    /* Decrypt login field -> Pronote username */
+    char plain_login[MAX_PLAIN_LEN] = {0};
+    if (pronote_decrypt(app.login, app.pin, plain_login, sizeof(plain_login)) != 0) {
+        LOG("login: login field decrypt failed");
+        safe_strncpy(app.status_message, "Decryption failed - wrong PIN?",
+                     sizeof(app.status_message));
+        return;
+    }
+    LOG("login: plain_login='%s'", plain_login);
+
+    /* Decrypt jeton field -> Pronote password */
+    char plain_jeton[MAX_PLAIN_LEN] = {0};
+    if (pronote_decrypt(app.jeton, app.pin, plain_jeton, sizeof(plain_jeton)) != 0) {
+        LOG("login: jeton field decrypt failed");
+        safe_strncpy(app.status_message, "Decryption failed - wrong PIN?",
+                     sizeof(app.status_message));
+        return;
+    }
+    LOG("login: plain_jeton='%s'", plain_jeton);
+
+    /* TODO: HTTP login with plain_login + plain_jeton + app.url */
+    safe_strncpy(app.status_message, "Decrypted! (HTTP login coming soon)",
+                 sizeof(app.status_message));
+    app.logged_in = 1;
 }
 
 int main(int argc, char *argv[]) {
@@ -197,112 +275,28 @@ int main(int argc, char *argv[]) {
     LOG("notApro started");
 
     memset(&app, 0, sizeof(AppState));
-    safe_strncpy(app.status_message, "Scan QR code, then enter PIN",
-                 sizeof(app.status_message));
     safe_strncpy(app.uuid, "3DS-Pronote-Device", sizeof(app.uuid));
-    app.screen       = SCREEN_LOGIN;
     app.needs_redraw = 1;
 
+    load_user_json();
+
     while (aptMainLoop()) {
-
-        if (app.screen == SCREEN_QR_SCAN) {
-            char qr_result[MAX_JETON_LEN + MAX_USERNAME_LEN + 64] = {0};
-            LOG("starting QR scan");
-            int rc = qr_scan(qr_result, sizeof(qr_result));
-
-            if (rc == QR_SUCCESS) {
-                LOG("QR scan success, raw len=%zu", strlen(qr_result));
-                char *lp = strstr(qr_result, "\"login\":");
-                char *jp = strstr(qr_result, "\"jeton\":");
-
-                if (lp && jp) {
-                    lp += 9;
-                    char *e = strchr(lp, '"');
-                    if (e) {
-                        size_t n = (size_t)(e - lp);
-                        if (n >= MAX_USERNAME_LEN) n = MAX_USERNAME_LEN - 1;
-                        memcpy(app.username, lp, n);
-                        app.username[n] = '\0';
-                        LOG("parsed username: %s", app.username);
-                    }
-                    jp += 9;
-                    e = strchr(jp, '"');
-                    if (e) {
-                        size_t n = (size_t)(e - jp);
-                        if (n >= MAX_JETON_LEN) n = MAX_JETON_LEN - 1;
-                        memcpy(app.jeton, jp, n);
-                        app.jeton[n] = '\0';
-                        LOG("parsed jeton (%zu chars)", strlen(app.jeton));
-                    }
-                    safe_strncpy(app.status_message, "QR scanned! Enter PIN.",
-                                 sizeof(app.status_message));
-                    app.current_field = 2;
-                } else {
-                    LOG("QR parse failed — unexpected format");
-                    safe_strncpy(app.status_message, "Invalid QR format.",
-                                 sizeof(app.status_message));
-                }
-            } else if (rc == QR_CANCELLED) {
-                LOG("QR scan cancelled");
-                safe_strncpy(app.status_message, "Scan cancelled.",
-                             sizeof(app.status_message));
-            } else {
-                LOG("QR scan error (rc=%d)", rc);
-                safe_strncpy(app.status_message, "QR scan failed.",
-                             sizeof(app.status_message));
-            }
-
-            app.screen       = SCREEN_LOGIN;
-            app.needs_redraw = 1;
-            continue;
-        }
-
         hidScanInput();
         u32 kdown = hidKeysDown();
 
-        if (kdown & KEY_START) {
-            LOG("exit requested");
-            break;
-        }
+        if (kdown & KEY_START) { LOG("exit requested"); break; }
 
-        if (kdown & KEY_UP) {
-            app.current_field = (app.current_field - 1 + 3) % 3;
-            app.needs_redraw  = 1;
-        }
-        if (kdown & KEY_DOWN) {
-            app.current_field = (app.current_field + 1) % 3;
-            app.needs_redraw  = 1;
-        }
         if (kdown & KEY_A) {
-            open_keyboard();
+            open_pin_keyboard();
             app.needs_redraw = 1;
         }
         if (kdown & KEY_Y) {
-            if      (app.current_field == 0) memset(app.username, 0, sizeof(app.username));
-            else if (app.current_field == 1) memset(app.jeton,    0, sizeof(app.jeton));
-            else                             memset(app.pin,       0, sizeof(app.pin));
-            LOG("field %d cleared", app.current_field);
+            memset(app.pin, 0, sizeof(app.pin));
+            LOG("PIN cleared");
             app.needs_redraw = 1;
         }
         if (kdown & KEY_X) {
-            if (strlen(app.username) == 0) {
-                LOG("login attempt: no username");
-                safe_strncpy(app.status_message, "Enter username first!",
-                             sizeof(app.status_message));
-            } else if (strlen(app.jeton) == 0) {
-                LOG("login attempt: no jeton");
-                safe_strncpy(app.status_message, "Scan QR code first!",
-                             sizeof(app.status_message));
-            } else if (strlen(app.pin) != 4) {
-                LOG("login attempt: PIN length %zu (expected 4)", strlen(app.pin));
-                safe_strncpy(app.status_message, "PIN must be 4 digits!",
-                             sizeof(app.status_message));
-            } else {
-                LOG("login attempt: user=%s, jeton_len=%zu", app.username, strlen(app.jeton));
-                safe_strncpy(app.status_message, "Decrypting... (coming soon)",
-                             sizeof(app.status_message));
-                app.logged_in = 1;
-            }
+            do_login();
             app.needs_redraw = 1;
         }
 
