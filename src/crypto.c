@@ -10,17 +10,13 @@
  * Both the login field and the jeton field are separately decryptable
  * with the same key/IV. Decrypting login yields the Pronote username;
  * decrypting jeton yields the Pronote password.
- *
- * Previous implementation used a hand-rolled AES that had a broken
- * InvMixColumns — the GF(2^8) multiply-by-{0e,0b,0d,09} was wrong,
- * producing incorrect plaintext on every block. Replaced with mbedTLS
- * which is available via pacman -S 3ds-mbedtls and is verified correct.
  */
 
 #include "crypto.h"
 #include "log.h"
 #include <mbedtls/md5.h>
 #include <mbedtls/aes.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -62,7 +58,6 @@ int pronote_decrypt(const char *hex, const char *pin,
         return -1;
     }
 
-    /* Decode hex ciphertext */
     uint8_t *ct = (uint8_t *)malloc(ct_len);
     if (!ct) return -1;
 
