@@ -36,8 +36,6 @@
  *   - default IV   = 0x00 * 16
  *   - session IV   = random 16 bytes sent as base64 in FonctionParametres
  *   - numeroOrdre  = AES256-CBC-encrypt(counter_str, current_key, current_iv) -> hex
- *   - first numeroOrdre with default key/IV encrypting "1" =
- *                    3fa959b13967e0ef176069e01e23c8d7
  *
  * libctru HTTP:
  *   httpcInit must be called before this function.
@@ -203,12 +201,11 @@ static char *http_post_json(const char *url, const char *json,
     httpcAddRequestHeaderField(&ctx, "Content-Type", "application/json");
 
     /*
-     * httpcAddPostDataRaw expects const u32* — the data pointer must be
-     * 4-byte aligned. json is a stack/heap string, not guaranteed aligned,
-     * so copy into an aligned buffer first.
+     * httpcAddPostDataRaw expects const u32* (4-byte aligned).
+     * Copy json into a heap-allocated aligned buffer before passing.
      */
     size_t json_len = strlen(json);
-    size_t aligned_sz = (json_len + 3) & ~(size_t)3;   /* round up to 4 */
+    size_t aligned_sz = (json_len + 3) & ~(size_t)3;
     u32 *aligned_buf = (u32 *)malloc(aligned_sz + 4);
     if (aligned_buf) {
         memset(aligned_buf, 0, aligned_sz + 4);
@@ -342,8 +339,16 @@ int pronote_login(const char *url,
     snprintf(api_url, sizeof(api_url),
              "%sappelfonction/%d/%d/1", root, espace_id, session_id);
 
-    char body[512];
-    snprintf(body, sizeof(body),
+    /*
+     * body is 2048 bytes to safely fit step 5, where `solved` can be
+     * up to 1024 hex chars (AES-256-CBC output of a 512-byte padded block).
+     * Steps 2 and 3 fit in ~500 bytes; 2048 covers all cases with margin.
+     * Allocated on heap to avoid large stack frames on ARM11.
+     */
+    char *body = (char *)malloc(2048);
+    if (!body) { httpcExit(); return -2; }
+
+    snprintf(body, 2048,
         "{\"nom\":\"FonctionParametres\","
         "\"session\":%d,"
         "\"numeroOrdre\":\"%s\","
@@ -353,7 +358,7 @@ int pronote_login(const char *url,
     resp = http_post_json(api_url, body, &status);
     if (!resp || status < 200 || status >= 300) {
         LOG("step2: FonctionParametres failed status=%d", status);
-        free(resp); httpcExit(); return -4;
+        free(body); free(resp); httpcExit(); return -4;
     }
     LOG("step2 ok");
     free(resp); resp = NULL;
@@ -364,7 +369,7 @@ int pronote_login(const char *url,
     snprintf(api_url, sizeof(api_url),
              "%sappelfonction/%d/%d/3", root, espace_id, session_id);
 
-    snprintf(body, sizeof(body),
+    snprintf(body, 2048,
         "{\"nom\":\"Identification\","
         "\"session\":%d,"
         "\"numeroOrdre\":\"%s\","
@@ -386,7 +391,7 @@ int pronote_login(const char *url,
     resp = http_post_json(api_url, body, &status);
     if (!resp || status < 200 || status >= 300) {
         LOG("step3: Identification failed status=%d", status);
-        free(resp); httpcExit(); return -5;
+        free(body); free(resp); httpcExit(); return -5;
     }
     LOG("step3 ok: %s", resp);
 
@@ -399,7 +404,7 @@ int pronote_login(const char *url,
 
     if (strlen(challenge) == 0) {
         LOG("step3: no challenge in response");
-        httpcExit(); return -5;
+        free(body); httpcExit(); return -5;
     }
 
     /* ===== Step 4: Solve challenge ====================================== */
@@ -427,12 +432,12 @@ int pronote_login(const char *url,
     if (hex_decode(challenge, chall_ct, &ct_len) != 0 ||
         ct_len == 0 || ct_len % 16 != 0) {
         LOG("solve: hex_decode challenge failed len=%zu", ct_len);
-        httpcExit(); return -6;
+        free(body); httpcExit(); return -6;
     }
     uint8_t chall_pt[512];
     if (aes256_cbc_dec(chall_key, cur_iv, chall_ct, ct_len, chall_pt)) {
         LOG("solve: AES decrypt failed");
-        httpcExit(); return -6;
+        free(body); httpcExit(); return -6;
     }
     uint8_t pad = chall_pt[ct_len-1];
     size_t pt_len = (pad>0&&pad<=16) ? ct_len-pad : ct_len;
@@ -444,7 +449,6 @@ int pronote_login(const char *url,
     for (size_t i = 0; i < pt_len; i += 2)
         modified[mi++] = (char)chall_pt[i];
     modified[mi] = '\0';
-    LOG("solve: modified='%s'", modified);
 
     uint8_t mod_padded[512];
     memcpy(mod_padded, modified, mi);
@@ -453,7 +457,7 @@ int pronote_login(const char *url,
     if (aes256_cbc_enc(chall_key, cur_iv,
                        mod_padded, mod_padded_len, chall_enc)) {
         LOG("solve: AES re-encrypt failed");
-        httpcExit(); return -6;
+        free(body); httpcExit(); return -6;
     }
     char solved[1024];
     hex_encode(chall_enc, mod_padded_len, solved, sizeof(solved));
@@ -465,7 +469,7 @@ int pronote_login(const char *url,
     snprintf(api_url, sizeof(api_url),
              "%sappelfonction/%d/%d/5", root, espace_id, session_id);
 
-    snprintf(body, sizeof(body),
+    snprintf(body, 2048,
         "{\"nom\":\"Authentification\","
         "\"numeroOrdre\":\"%s\","
         "\"session\":%d,"
@@ -477,6 +481,7 @@ int pronote_login(const char *url,
         num_ordre, session_id, solved, espace_id);
 
     resp = http_post_json(api_url, body, &status);
+    free(body);
     if (!resp || status < 200 || status >= 300) {
         LOG("step5: Authentification failed status=%d", status);
         free(resp); httpcExit(); return -7;
