@@ -1,19 +1,23 @@
 #pragma once
-#include <stdint.h>
 #include <stddef.h>
 
 /*
- * Pronote jeton decryption.
+ * pronote_decrypt(hex, pin, out_buf, out_len)
  *
- * The Pronote QR code contains a JSON payload with a "jeton" field.
- * The jeton is a hex-encoded AES-128-CBC ciphertext:
- *   key = MD5(PIN as ASCII string)   -- 16 bytes
- *   IV  = 16 zero bytes
+ * Decrypts a hex-encoded Pronote AES-128-CBC ciphertext using the
+ * 4-digit PIN as the key source.
  *
- * pronote_decrypt_jeton() decodes the hex, decrypts in-place, strips
- * PKCS#7 padding, and writes the plaintext to out_buf.
+ * Used for both fields from user.json:
+ *   - "login" field  -> Pronote username
+ *   - "jeton" field  -> Pronote password
  *
- * Returns 0 on success, -1 on error (bad hex, bad padding, buf too small).
+ * Algorithm:
+ *   key       = MD5(pin_as_ascii_string)   // 16 bytes
+ *   IV        = 0x00 * 16
+ *   plaintext = AES-128-CBC-decrypt(hex_decode(hex), key, IV)
+ *   result    = PKCS7-unpad(plaintext)
+ *
+ * Returns 0 on success, -1 on error.
  */
-int pronote_decrypt_jeton(const char *jeton_hex, const char *pin,
-                          char *out_buf, size_t out_len);
+int pronote_decrypt(const char *hex, const char *pin,
+                    char *out_buf, size_t out_len);

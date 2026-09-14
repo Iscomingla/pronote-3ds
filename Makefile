@@ -12,7 +12,7 @@ include $(DEVKITARM)/3ds_rules
 #---------------------------------------------------------------------------------
 TARGET			:=	$(notdir $(CURDIR))
 BUILD			:=	build
-SOURCES			:=	src lib/quirc lib/aes lib/md5
+SOURCES			:=	src lib/quirc
 DATA			:=	data
 INCLUDES		:=	include lib
 GRAPHICS		:=	gfx
@@ -20,9 +20,6 @@ GFXBUILD		:=	$(BUILD)
 APP_TITLE		:=	notApro
 APP_DESCRIPTION	:=	acces to Pronote student from 3DS
 APP_AUTHOR		:=	Iscomingla
-#ICON			:=
-#ROMFS		:=	romfs
-#GFXBUILD	:=	$(ROMFS)/gfx
 
 #---------------------------------------------------------------------------------
 ARCH	:=	-march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
@@ -38,7 +35,9 @@ CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++11
 ASFLAGS	:=	-g $(ARCH)
 LDFLAGS	=	-specs=3dsx.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 
-LIBS	:= -lcitro2d -lcitro3d -lctru -lm
+# mbedTLS provides AES-128-CBC and MD5 for Pronote jeton decryption.
+# Link order matters: citro2d -> citro3d -> ctru; mbedtls -> mbedcrypto.
+LIBS	:= -lcitro2d -lcitro3d -lctru -lmbedtls -lmbedcrypto -lm
 
 #---------------------------------------------------------------------------------
 LIBDIRS	:= $(CTRULIB)
@@ -195,18 +194,3 @@ $(OUTPUT).elf	:	$(OFILES)
 #---------------------------------------------------------------------------------------
 endif
 #---------------------------------------------------------------------------------------
-
-CIA_NAME := $(TARGET).cia
-BANNERTOOL := $(HOME)/Apps/3ds/bannertool.exe
-MAKEROM := $(HOME)/Apps/3ds/makerom
-
-cia: $(OUTPUT).3dsx
-	@echo "Building CIA..."
-	@mkdir -p build
-	@echo "Note: Full CIA building requires proper metadata setup"
-	@echo ".3dsx available at: $(OUTPUT).3dsx"
-	@echo "You can install .3dsx using Homebrew Channel or FBI"
-	@echo ""
-	@echo "To build CIA: Use build_cia.sh script"
-
-.PHONY: cia
