@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include "ui.h"
 #include "network.h"
 #include "crypto.h"
@@ -33,12 +34,12 @@
 #define CTRL_DESC_X  64.0f
 
 typedef struct {
-    char  login[MAX_LOGIN_LEN];   /* encrypted hex from QR */
-    char  jeton[MAX_JETON_LEN];   /* encrypted hex from QR */
-    char  url[256];               /* school pronote URL */
-    char  pin[MAX_PIN];           /* 4-digit PIN */
-    char  uuid[UUID_LEN];         /* stable device UUID */
-    char  token[MAX_TOKEN_LEN];   /* saved jetonConnexionAppliMobile */
+    char  login[MAX_LOGIN_LEN];
+    char  jeton[MAX_JETON_LEN];
+    char  url[256];
+    char  pin[MAX_PIN];
+    char  uuid[UUID_LEN];
+    char  token[MAX_TOKEN_LEN];
     int   logged_in;
     int   user_loaded;
     char  status_message[128];
@@ -75,7 +76,6 @@ static int json_extract(const char *json, const char *key,
     return 1;
 }
 
-/* Simple UUID v4 generator using sysclock entropy */
 static void generate_uuid(char *buf, size_t buf_sz) {
     if (buf_sz < UUID_LEN) return;
     u64 t1 = svcGetSystemTick();
@@ -97,11 +97,9 @@ static void load_user_json(void) {
                      sizeof(app.status_message));
         return;
     }
-
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     rewind(f);
-
     if (sz <= 0 || sz > 4096) {
         LOG("user.json size %ld out of range", sz);
         fclose(f);
@@ -109,19 +107,18 @@ static void load_user_json(void) {
                      sizeof(app.status_message));
         return;
     }
-
     char *buf = (char *)malloc((size_t)sz + 1);
     if (!buf) { fclose(f); return; }
     size_t rd = fread(buf, 1, (size_t)sz, f);
     fclose(f);
     buf[rd] = '\0';
-
     LOG("user.json raw: %s", buf);
 
     int ok_l = json_extract(buf, "login", app.login, sizeof(app.login));
     int ok_j = json_extract(buf, "jeton", app.jeton, sizeof(app.jeton));
     int ok_u = json_extract(buf, "url",   app.url,   sizeof(app.url));
     free(buf);
+    (void)ok_u;
 
     if (ok_l && ok_j) {
         app.user_loaded = 1;
@@ -134,13 +131,9 @@ static void load_user_json(void) {
         safe_strncpy(app.status_message, "user.json: missing login or jeton",
                      sizeof(app.status_message));
     }
-
-    (void)ok_u;
 }
 
-/* Save token to SD for reuse on next boot */
 static void save_token(const char *token) {
-    /* Ensure dir exists */
     mkdir("sdmc:/3ds", 0777);
     mkdir("sdmc:/3ds/notApro", 0777);
     FILE *f = fopen(TOKEN_PATH, "w");
@@ -154,11 +147,9 @@ static void draw_field(float y, const char *label, const char *value,
                        int is_masked, int selected) {
     u32 bg   = selected ? COL_SELECTED : C2D_Color32(0x00, 0x00, 0x00, 0x28);
     u32 bord = selected ? COL_LINE1    : COL_LINE2;
-
     ui_rect(FIELD_X, y, FIELD_W, FIELD_H, bg);
     ui_hline(FIELD_X, y + FIELD_H - 1.0f, FIELD_W, bord);
     ui_text(FIELD_X + 8.0f, y + 4.0f, 0.45f, COL_DIMTEXT, label);
-
     char display[128] = {0};
     if (is_masked && strlen(value) > 0) {
         for (int i = 0; i < (int)strlen(value) && i < 4; i++)
@@ -171,17 +162,14 @@ static void draw_field(float y, const char *label, const char *value,
     } else {
         safe_strncpy(display, value, sizeof(display));
     }
-
     u32 val_col = strlen(value) == 0 ? COL_DIMTEXT : COL_WHITE;
     ui_text(FIELD_X + 8.0f, y + 16.0f, 0.55f, val_col, display);
-
     if (selected)
         ui_rect(FIELD_X, y + FIELD_H * 0.25f, 3.0f, FIELD_H * 0.5f, COL_LINE1);
 }
 
 static void draw_login_screen(void) {
     ui_frame_begin();
-
     ui_clear_target(ui_get_target(GFX_TOP),    COL_BG);
     ui_clear_target(ui_get_target(GFX_BOTTOM), COL_BG);
 
@@ -192,17 +180,13 @@ static void draw_login_screen(void) {
     ui_rect(0, STRIPE2_Y, SCREEN_TOP_W, STRIPE2_H, COL_LINE2);
 
     float fy = CONTENT_Y;
-
-    const char *login_label = app.user_loaded
-                              ? "Login (from user.json)"
-                              : "Login (no user.json found)";
-    draw_field(fy, login_label, app.login, 0, 0);
+    draw_field(fy, app.user_loaded ? "Login (from user.json)"
+                                   : "Login (no user.json found)",
+               app.login, 0, 0);
     fy += FIELD_H + FIELD_GAP;
-
-    const char *jeton_val = strlen(app.jeton) > 0 ? "OK" : "(empty)";
-    draw_field(fy, "Jeton (from user.json)", jeton_val, 0, 0);
+    draw_field(fy, "Jeton (from user.json)",
+               strlen(app.jeton) > 0 ? "OK" : "(empty)", 0, 0);
     fy += FIELD_H + FIELD_GAP;
-
     draw_field(fy, "PIN (4 digits)  [A: enter]", app.pin, 1, 1);
 
     ui_rect(0, STATUS_Y, SCREEN_TOP_W, STATUS_H,
@@ -214,11 +198,10 @@ static void draw_login_screen(void) {
     ui_rect(0, 0, SCREEN_BOT_W, HEADER_H, C2D_Color32(0x00, 0x60, 0x52, 0xFF));
     ui_text_centred(0, SCREEN_BOT_W, 8.0f, 0.65f, COL_WHITE, "Controls");
     ui_hline(0, HEADER_H, SCREEN_BOT_W, COL_LINE1);
-
     float cy = HEADER_H + 10.0f;
     const float lsz = 0.50f, lg = 18.0f;
     const char *keys[]  = { "A", "Y", "X", "START" };
-    const char *descs[] = { "Enter PIN", "Clear PIN", "Login", "Exit" };
+    const char *descs[] = { "Enter PIN", "Clear PIN", "Login", "Exit app" };
     for (int i = 0; i < 4; i++) {
         ui_text(CTRL_KEY_X,  cy, lsz, COL_LINE1, keys[i]);
         ui_text(CTRL_DESC_X, cy, lsz, COL_WHITE,  descs[i]);
@@ -226,7 +209,6 @@ static void draw_login_screen(void) {
     }
     ui_hline(0, SCREEN_H - 3.0f, SCREEN_BOT_W, COL_LINE2);
     ui_hline(0, SCREEN_H - 1.0f, SCREEN_BOT_W, COL_LINE1);
-
     ui_frame_end();
 }
 
@@ -234,12 +216,10 @@ static void open_pin_keyboard(void) {
     SwkbdState swkbd;
     char tmp[MAX_PIN] = {0};
     safe_strncpy(tmp, app.pin, sizeof(tmp));
-
     swkbdInit(&swkbd, SWKBD_TYPE_NUMPAD, 1, 4);
     swkbdSetPasswordMode(&swkbd, SWKBD_PASSWORD_HIDE_DELAY);
     swkbdSetHintText(&swkbd, "Enter 4-digit PIN");
     if (tmp[0] != '\0') swkbdSetInitialText(&swkbd, tmp);
-
     memset(tmp, 0, sizeof(tmp));
     if (swkbdInputText(&swkbd, tmp, sizeof(tmp)) == SWKBD_BUTTON_CONFIRM) {
         safe_strncpy(app.pin, tmp, sizeof(app.pin));
@@ -260,7 +240,6 @@ static void do_login(void) {
         return;
     }
 
-    /* --- Decrypt credentials ------------------------------------------- */
     safe_strncpy(app.status_message, "Decrypting...", sizeof(app.status_message));
     draw_login_screen();
 
@@ -280,18 +259,13 @@ static void do_login(void) {
     }
     LOG("plain_jeton obtained (len=%zu)", strlen(plain_jeton));
 
-    /* --- HTTP login ------------------------------------------------------- */
     safe_strncpy(app.status_message, "Connecting...", sizeof(app.status_message));
     draw_login_screen();
 
     char new_token[MAX_TOKEN_LEN] = {0};
     int result = pronote_login(
-        app.url,
-        plain_login,
-        plain_jeton,
-        app.uuid,
-        new_token,
-        sizeof(new_token)
+        app.url, plain_login, plain_jeton,
+        app.uuid, new_token, sizeof(new_token)
     );
 
     if (result == 0) {
@@ -310,45 +284,29 @@ static void do_login(void) {
 
 int main(int argc, char *argv[]) {
     (void)argc; (void)argv;
-
     gfxInitDefault();
     log_init();
     ui_init();
-
     LOG("notApro started");
 
     memset(&app, 0, sizeof(AppState));
     generate_uuid(app.uuid, sizeof(app.uuid));
     LOG("uuid=%s", app.uuid);
     app.needs_redraw = 1;
-
     load_user_json();
 
     while (aptMainLoop()) {
         hidScanInput();
         u32 kdown = hidKeysDown();
-
         if (kdown & KEY_START) { LOG("exit requested"); break; }
-
-        if (kdown & KEY_A) {
-            open_pin_keyboard();
-            app.needs_redraw = 1;
-        }
+        if (kdown & KEY_A) { open_pin_keyboard(); app.needs_redraw = 1; }
         if (kdown & KEY_Y) {
             memset(app.pin, 0, sizeof(app.pin));
             LOG("PIN cleared");
             app.needs_redraw = 1;
         }
-        if (kdown & KEY_X) {
-            do_login();
-            app.needs_redraw = 1;
-        }
-
-        if (app.needs_redraw) {
-            draw_login_screen();
-            app.needs_redraw = 0;
-        }
-
+        if (kdown & KEY_X) { do_login(); app.needs_redraw = 1; }
+        if (app.needs_redraw) { draw_login_screen(); app.needs_redraw = 0; }
         gspWaitForVBlank();
     }
 
